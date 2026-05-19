@@ -33,7 +33,7 @@ public:
                     ID3D11DeviceContext* d3dContext = nullptr);
     void Stop();
 
-    void SubmitVideoFrame(const std::vector<uint8_t>& rawData,
+    void SubmitVideoFrame(std::vector<uint8_t> rawData,
                           uint32_t width, uint32_t height,
                           int64_t timestampMs);
     void SubmitAudioFrame(const std::vector<uint8_t>& rawData, int64_t timestampMs);

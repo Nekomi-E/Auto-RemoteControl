@@ -368,11 +368,9 @@ void D3d11Renderer::Resize(uint32_t width, uint32_t height) {
 void D3d11Renderer::RenderFrame(const uint8_t* rgbaData, uint32_t width, uint32_t height) {
     if (!m_device || !m_context || !m_rtv) return;
 
-    // Clear to black
-    float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    m_context->ClearRenderTargetView(m_rtv, clearColor);
-
     if (rgbaData && width > 0 && height > 0) {
+        // Skip ClearRenderTargetView when the video texture covers the full viewport —
+        // the fullscreen triangle overwrites every pixel, making the clear redundant.
         // Recreate texture if dimensions changed
         if (!m_videoTexture || m_textureWidth != width || m_textureHeight != height) {
             if (m_videoSRV) { m_videoSRV->Release(); m_videoSRV = nullptr; }

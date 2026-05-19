@@ -6,6 +6,7 @@
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct IMFActivate;
+struct IMFSample;
 
 class MfVideoEncoder {
 public:
@@ -33,7 +34,14 @@ private:
                                       ID3D11Device* captureDevice,
                                       ID3D11DeviceContext* captureContext,
                                       Impl* impl);
+    static bool InitVideoProcessor(Impl* impl, uint32_t width, uint32_t height);
+    static bool ConvertBgraToNv12Gpu(Impl* impl, const uint8_t* bgraData,
+                                     uint32_t width, uint32_t height,
+                                     IMFSample** outSample);
     bool ConfigureMediaTypes();
+    bool TrySetInputType(uint32_t resW, uint32_t resH);
+    bool TrySetOutputType(uint32_t resW, uint32_t resH);
+    void FinalizeMediaTypes(uint32_t resW, uint32_t resH);
     bool ProcessInput(const uint8_t* rawFrame, uint32_t width, uint32_t height);
     bool ProcessOutput(std::vector<uint8_t>& outBitstream, bool& outIsKeyFrame);
 

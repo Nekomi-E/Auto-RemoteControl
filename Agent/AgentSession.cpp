@@ -3,6 +3,7 @@
 #include "Common/Utils/Logger.h"
 #include "Common/Utils/Timer.h"
 #include "Common/Utils/DebugScreenshot.h"
+#include <thread>
 
 AgentSession::AgentSession() {}
 
@@ -182,19 +183,26 @@ void AgentSession::CaptureThread() {
         uint32_t width, height;
         std::vector<uint8_t> frameData;
         if (m_captureMgr->AcquireFrame(frameData, width, height)) {
-            m_encoderMgr->SubmitVideoFrame(frameData, width, height, Timer::NowMs());
             frameCount++;
             if (frameCount == 1) {
                 LOG_INFO("[Capture] First frame captured: %ux%u", width, height);
             }
 
             // DEBUG: Save raw capture to BMP every ~5 seconds (up to 10)
+            // Run on a background thread so disk I/O doesn't stall the capture pipeline
             auto now = Timer::NowMs();
             if (debugSaveCount < 10 && (debugSaveCount == 0 || now - lastDebugSaveMs >= 5000)) {
-                SaveBmp("agent_capture", frameData.data(), width, height, true);
                 lastDebugSaveMs = now;
                 debugSaveCount++;
+                std::vector<uint8_t> copyForSave = frameData; // deep copy before we move()
+                std::thread([](std::vector<uint8_t> data, uint32_t w, uint32_t h, uint32_t cnt) {
+                    char prefix[64];
+                    snprintf(prefix, sizeof(prefix), "agent_capture_%u", cnt);
+                    SaveBmp(prefix, data.data(), w, h, true);
+                }, std::move(copyForSave), width, height, debugSaveCount).detach();
             }
+
+            m_encoderMgr->SubmitVideoFrame(std::move(frameData), width, height, Timer::NowMs());
         } else {
             failCount++;
         }

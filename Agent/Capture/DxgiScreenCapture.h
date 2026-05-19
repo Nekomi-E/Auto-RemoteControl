@@ -25,6 +25,7 @@ public:
     void Shutdown();
 
     bool AcquireFrame(CapturedFrame& outFrame);
+    void SetTargetFps(uint32_t fps) { m_targetFps = fps; }
     std::vector<MonitorDesc> GetMonitors() const;
 
 private:
@@ -43,6 +44,7 @@ private:
     std::vector<MonitorCapture> m_monitors;
     int m_currentMonitor = 0;
     int64_t m_lastFrameTime = 0;
+    uint32_t m_targetFps = 60;
 };
 
 // Helper to save BGRA frame to BMP file (for debugging)

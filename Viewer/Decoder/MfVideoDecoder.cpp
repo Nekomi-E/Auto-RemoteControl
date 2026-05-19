@@ -8,6 +8,8 @@
 #include <codecapi.h>
 #include <wmcodecdsp.h>
 #include <cstring>
+#include <future>
+#include <thread>
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mf.lib")
@@ -185,6 +187,65 @@ static void Nv12ToBgra(const uint8_t* nv12, uint32_t width, uint32_t height,
             dst[3] = 255;
         }
     }
+}
+
+// Parallel NV12→BGRA: each row is independent (only reads shared UV plane).
+static void Nv12ToBgraChunk(const uint8_t* yPlane, const uint8_t* uvPlane,
+                            uint32_t width, uint32_t height, int32_t yStride,
+                            uint32_t startRow, uint32_t endRow,
+                            uint8_t* bgra) {
+    for (uint32_t row = startRow; row < endRow; ++row) {
+        for (uint32_t col = 0; col < width; ++col) {
+            int y = yPlane[row * yStride + col] - 16;
+            int uvRowOff = (row / 2) * yStride + (col / 2) * 2;
+            int u = uvPlane[uvRowOff] - 128;
+            int v = uvPlane[uvRowOff + 1] - 128;
+
+            int r = (298 * y + 409 * v + 128) >> 8;
+            int g = (298 * y - 100 * u - 208 * v + 128) >> 8;
+            int b = (298 * y + 516 * u + 128) >> 8;
+
+            r = r < 0 ? 0 : (r > 255 ? 255 : r);
+            g = g < 0 ? 0 : (g > 255 ? 255 : g);
+            b = b < 0 ? 0 : (b > 255 ? 255 : b);
+
+            uint8_t* dst = bgra + (row * width + col) * 4;
+            dst[0] = static_cast<uint8_t>(b);
+            dst[1] = static_cast<uint8_t>(g);
+            dst[2] = static_cast<uint8_t>(r);
+            dst[3] = 255;
+        }
+    }
+}
+
+static void Nv12ToBgraParallel(const uint8_t* nv12, uint32_t width, uint32_t height,
+                               int32_t yStride, std::vector<uint8_t>& bgra,
+                               size_t uvOffset = 0) {
+    bgra.resize(width * height * 4);
+    const uint8_t* yPlane = nv12;
+    size_t uvOff = uvOffset ? uvOffset : static_cast<size_t>(yStride) * height;
+    const uint8_t* uvPlane = nv12 + uvOff;
+    uint8_t* dst = bgra.data();
+
+    unsigned int nThreads = std::thread::hardware_concurrency();
+    if (nThreads < 2 || height < 120) {
+        Nv12ToBgraChunk(yPlane, uvPlane, width, height, yStride, 0, height, dst);
+        return;
+    }
+    if (nThreads > 8) nThreads = 8;
+
+    uint32_t rowsPerThread = (height + nThreads - 1) / nThreads;
+    std::vector<std::future<void>> futures;
+
+    for (unsigned int t = 0; t < nThreads; ++t) {
+        uint32_t start = t * rowsPerThread;
+        if (start >= height) break;
+        uint32_t end = (start + rowsPerThread < height) ? start + rowsPerThread : height;
+        futures.push_back(std::async(std::launch::async,
+            Nv12ToBgraChunk, yPlane, uvPlane, width, height, yStride,
+            start, end, dst));
+    }
+    for (auto& f : futures) f.get();
 }
 
 // YV12: Y (stride=yStride), V (stride=yStride/2), U (stride=yStride/2)
@@ -481,7 +542,7 @@ static bool DrainDecoderOutput(IMFTransform* mft, uint32_t& width, uint32_t& hei
             } else if (subtype == MFVideoFormat_YUY2) {
                 Yuy2ToBgra(data, convWidth, convHeight, actualStride, outRGBA);
             } else {
-                Nv12ToBgra(data, convWidth, convHeight, actualStride, outRGBA, uvOffset);
+                Nv12ToBgraParallel(data, convWidth, convHeight, actualStride, outRGBA, uvOffset);
             }
             outWidth = convWidth;
             outHeight = convHeight;
@@ -536,8 +597,8 @@ bool MfVideoDecoder::DecodeFrame(const uint8_t* bitstream, size_t len,
 
     // Set sample time (some decoders require this)
     sample->SetSampleTime(m_impl->sampleTime);
-    sample->SetSampleDuration(333333); // ~33ms at 30fps
-    m_impl->sampleTime += 333333;
+    sample->SetSampleDuration(166667); // ~16.7ms at 60fps
+    m_impl->sampleTime += 166667;
 
     hr = m_impl->mft->ProcessInput(0, sample, 0);
     sample->Release();
@@ -562,7 +623,7 @@ bool MfVideoDecoder::DecodeFrame(const uint8_t* bitstream, size_t len,
         sample->AddBuffer(mediaBuffer);
         mediaBuffer->Release();
         sample->SetSampleTime(m_impl->sampleTime);
-        sample->SetSampleDuration(333333);
+        sample->SetSampleDuration(166667);
         hr = m_impl->mft->ProcessInput(0, sample, 0);
         sample->Release();
     }

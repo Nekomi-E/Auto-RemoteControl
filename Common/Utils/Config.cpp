@@ -72,7 +72,7 @@ void Config::PrintAgentHelp() {
     printf("  --port N        TCP/UDP port to listen on (default: 27015)\n");
     printf("  --password STR  Authentication password (required)\n");
     printf("  --bitrate N     Video bitrate in bps (default: auto, scaled to resolution)\n");
-    printf("  --fps N         Target capture framerate (default: 30)\n");
+    printf("  --fps N         Target capture framerate (default: 60)\n");
     printf("  --no-audio      Disable audio capture\n");
     printf("  --no-encrypt    Disable encryption (not recommended)\n");
     printf("  --help, -h      Show this help\n");

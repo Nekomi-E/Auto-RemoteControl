@@ -9,7 +9,10 @@
 #include <wmcodecdsp.h>
 #include <cstring>
 #include <algorithm>
+#include <future>
+#include <thread>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi1_2.h>
 
 #pragma comment(lib, "mfplat.lib")
@@ -32,7 +35,7 @@ struct MfVideoEncoder::Impl {
     uint32_t width = 1920;
     uint32_t height = 1080;
     uint32_t bitrate = 0;             // 0 = auto
-    uint32_t fps = 30;
+    uint32_t fps = 60;
     uint32_t frameIndex = 0;
     uint32_t codecType = 0;           // 0=H.264, 1=HEVC
 
@@ -42,6 +45,25 @@ struct MfVideoEncoder::Impl {
     // Codec data (SPS/PPS) read from output type after configuration
     // Prepend to first frame after each keyframe request
     std::vector<uint8_t> codecData;
+
+    // Cached buffers to avoid per-frame heap allocations
+    std::vector<uint8_t> nv12Buffer;       // reusable NV12 conversion buffer (~6 MB)
+    ID3D11Texture2D* gpuTexture = nullptr; // cached GPU encoder input texture
+    uint32_t gpuTexWidth = 0;
+    uint32_t gpuTexHeight = 0;
+
+    // GPU video processor for hardware BGRA→NV12 color conversion
+    ID3D11VideoDevice* videoDevice = nullptr;
+    ID3D11VideoContext* videoContext = nullptr;
+    ID3D11VideoProcessorEnumerator* vpEnumerator = nullptr;
+    ID3D11VideoProcessor* videoProcessor = nullptr;
+    ID3D11Texture2D* bgraGpuTex = nullptr;     // cached BGRA input
+    ID3D11Texture2D* nv12GpuTex = nullptr;     // cached NV12 output from video processor
+    ID3D11VideoProcessorInputView* vpInputView = nullptr;
+    ID3D11VideoProcessorOutputView* vpOutputView = nullptr;
+    uint32_t vpWidth = 0, vpHeight = 0;        // dimensions for cached VP resources
+    bool vpWorking = false;                     // GPU VP produces valid output
+    bool vpValidated = false;                   // VP output has been validated
 };
 
 MfVideoEncoder::MfVideoEncoder() : m_impl(std::make_unique<Impl>()) {}
@@ -245,7 +267,15 @@ bool MfVideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
                 if (m_impl->outputType) { m_impl->outputType->Release(); m_impl->outputType = nullptr; }
                 if (m_impl->deviceManager) { m_impl->deviceManager->Release(); m_impl->deviceManager = nullptr; }
 
-                if (!SetupEncoderCandidate(hevcHwActivates[i], i, d3dDevice, d3dContext, m_impl.get())) {
+                bool setupOk = false;
+                __try {
+                    setupOk = SetupEncoderCandidate(hevcHwActivates[i], i, d3dDevice, d3dContext, m_impl.get());
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    LOG_WARNING("  HEVC encoder #%u: SetupEncoderCandidate crashed (0x%08X)",
+                                i, GetExceptionCode());
+                    setupOk = false;
+                }
+                if (!setupOk) {
                     if (name) CoTaskMemFree(name);
                     continue;
                 }
@@ -336,23 +366,20 @@ bool MfVideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
                     LOG_INFO("  H.264 encoder candidate #%u: %S", i, name);
                 }
 
-                if (name) {
-                    bool skip = (wcsstr(name, L"Intel") != nullptr ||
-                                 wcsstr(name, L"Quick Sync") != nullptr ||
-                                 wcsstr(name, L"NVIDIA") != nullptr);
-                    if (skip) {
-                        LOG_INFO("  Skipping H.264 #%u (known crash)", i);
-                        CoTaskMemFree(name);
-                        continue;
-                    }
-                }
-
                 if (m_impl->mft) { m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0); m_impl->mft->Release(); m_impl->mft = nullptr; }
                 if (m_impl->inputType) { m_impl->inputType->Release(); m_impl->inputType = nullptr; }
                 if (m_impl->outputType) { m_impl->outputType->Release(); m_impl->outputType = nullptr; }
                 if (m_impl->deviceManager) { m_impl->deviceManager->Release(); m_impl->deviceManager = nullptr; }
 
-                if (!SetupEncoderCandidate(hwActivates[i], i, d3dDevice, d3dContext, m_impl.get())) {
+                bool setupOk = false;
+                __try {
+                    setupOk = SetupEncoderCandidate(hwActivates[i], i, d3dDevice, d3dContext, m_impl.get());
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    LOG_WARNING("  H.264 encoder #%u: SetupEncoderCandidate crashed (0x%08X)",
+                                i, GetExceptionCode());
+                    setupOk = false;
+                }
+                if (!setupOk) {
                     if (name) CoTaskMemFree(name);
                     continue;
                 }
@@ -438,21 +465,45 @@ void MfVideoEncoder::Shutdown() {
     if (m_impl->inputType) m_impl->inputType->Release();
     if (m_impl->outputType) m_impl->outputType->Release();
     if (m_impl->deviceManager) m_impl->deviceManager->Release();
+    if (m_impl->gpuTexture) m_impl->gpuTexture->Release();
+    if (m_impl->vpInputView) m_impl->vpInputView->Release();
+    if (m_impl->vpOutputView) m_impl->vpOutputView->Release();
+    if (m_impl->videoProcessor) m_impl->videoProcessor->Release();
+    if (m_impl->vpEnumerator) m_impl->vpEnumerator->Release();
+    if (m_impl->videoContext) m_impl->videoContext->Release();
+    if (m_impl->videoDevice) m_impl->videoDevice->Release();
+    if (m_impl->bgraGpuTex) m_impl->bgraGpuTex->Release();
+    if (m_impl->nv12GpuTex) m_impl->nv12GpuTex->Release();
     m_impl->mft = nullptr;
     m_impl->inputType = nullptr;
     m_impl->outputType = nullptr;
     m_impl->deviceManager = nullptr;
     m_impl->d3dDevice = nullptr;
     m_impl->d3dContext = nullptr;
+    m_impl->gpuTexture = nullptr;
+    m_impl->gpuTexWidth = 0;
+    m_impl->gpuTexHeight = 0;
+    m_impl->videoDevice = nullptr;
+    m_impl->videoContext = nullptr;
+    m_impl->vpEnumerator = nullptr;
+    m_impl->videoProcessor = nullptr;
+    m_impl->bgraGpuTex = nullptr;
+    m_impl->nv12GpuTex = nullptr;
+    m_impl->vpInputView = nullptr;
+    m_impl->vpOutputView = nullptr;
+    m_impl->vpWidth = 0;
+    m_impl->vpHeight = 0;
+    m_impl->vpWorking = false;
+    m_impl->vpValidated = false;
 }
 
-// Compute a minimum reasonable bitrate for the given resolution and fps.
-// Uses 0.1 bits-per-pixel as a floor — below this, H.264 encoders tend to
-// silently downscale, defeating the configured resolution.
+// Compute a minimum bitrate for visually transparent quality at the given resolution.
+// Uses 0.5 bits-per-pixel — HEVC at this rate produces no visible blocking/banding
+// even on gradient-heavy content (smooth grayscale ramps, sky gradients, etc.).
 static uint32_t ComputeMinBitrate(uint32_t width, uint32_t height, uint32_t fps) {
     uint64_t pixels = static_cast<uint64_t>(width) * height;
-    uint32_t minBps = static_cast<uint32_t>(pixels * fps / 10);
-    if (minBps < 1000000) minBps = 1000000;
+    uint32_t minBps = static_cast<uint32_t>(pixels * fps / 2);
+    if (minBps < 4000000) minBps = 4000000;
     return minBps;
 }
 
@@ -517,8 +568,163 @@ bool MfVideoEncoder::ConfigureMediaTypes() {
 
     auto ladder = BuildResolutionLadder(m_impl->width, m_impl->height);
 
+    // Output configs to try, from bare to fully-decorated
+    struct OutCfg { bool setBitrate; bool setProfileLevel; };
+    static const OutCfg kOutCfgs[] = {
+        { false, false },  // bare minimum, let encoder pick everything
+        { true,  false },  // add bitrate
+        { true,  true  },  // full: bitrate + profile + level
+    };
+
     for (auto& [resW, resH] : ladder) {
-        // --- Set output type at this resolution ---
+        // --- Approach A: input type first (standard MFTs) ---
+        // Clean state for this attempt
+        if (m_impl->inputType)  { m_impl->inputType->Release();  m_impl->inputType = nullptr; }
+        if (m_impl->outputType) { m_impl->outputType->Release(); m_impl->outputType = nullptr; }
+
+        bool inputOk = TrySetInputType(resW, resH);
+        bool outputOk = false;
+
+        if (inputOk) {
+            outputOk = TrySetOutputType(resW, resH);
+            if (outputOk) {
+                FinalizeMediaTypes(resW, resH);
+                return true;
+            }
+        }
+
+        // --- Approach B: output type first (NVIDIA, some HW MFTs) ---
+        // Release everything and try the reverse order — many hardware MFTs
+        // require output type to be committed before they'll report/accept
+        // input types.
+        if (m_impl->inputType)  { m_impl->inputType->Release();  m_impl->inputType = nullptr; }
+        if (m_impl->outputType) { m_impl->outputType->Release(); m_impl->outputType = nullptr; }
+
+        outputOk = TrySetOutputType(resW, resH);
+        if (outputOk) {
+            inputOk = TrySetInputType(resW, resH);
+            if (inputOk) {
+                FinalizeMediaTypes(resW, resH);
+                return true;
+            }
+            LOG_INFO("  Output-first: output accepted but input rejected %ux%u", resW, resH);
+        } else {
+            LOG_INFO("  Output-first: SetOutputType rejected %ux%u", resW, resH);
+        }
+
+        LOG_INFO("  Encoder rejected resolution %ux%u (both orderings)", resW, resH);
+    }
+
+    LOG_ERROR("No resolution in ladder accepted by encoder (tried %zu rungs from %ux%u)",
+              ladder.size(), m_impl->width, m_impl->height);
+    return false;
+}
+
+bool MfVideoEncoder::TrySetInputType(uint32_t resW, uint32_t resH) {
+    HRESULT hr;
+
+    struct InputConfigAttempt {
+        bool setAllSamplesIndependent;
+        UINT32 interlaceMode;
+    };
+    static const InputConfigAttempt kInputConfigs[] = {
+        { false, MFVideoInterlace_MixedInterlaceOrProgressive },
+        { false, MFVideoInterlace_Progressive },
+        { true,  MFVideoInterlace_MixedInterlaceOrProgressive },
+    };
+
+    // Try MFT's preferred input types
+    for (DWORD i = 0; i < 16; ++i) {
+        IMFMediaType* availableType = nullptr;
+        hr = m_impl->mft->GetInputAvailableType(0, i, &availableType);
+        if (FAILED(hr)) {
+            if (i == 0) {
+                LOG_INFO("  GetInputAvailableType[0] failed: 0x%08X", hr);
+            }
+            break;
+        }
+
+        GUID subtype = GUID_NULL;
+        hr = availableType->GetGUID(MF_MT_SUBTYPE, &subtype);
+        if (i < 4) {
+            wchar_t subtypeName[64] = L"?";
+            if (subtype == MFVideoFormat_NV12)       wcscpy(subtypeName, L"NV12");
+            else if (subtype == MFVideoFormat_YV12)   wcscpy(subtypeName, L"YV12");
+            else if (subtype == MFVideoFormat_IYUV)   wcscpy(subtypeName, L"I420");
+            else if (subtype == MFVideoFormat_I420)   wcscpy(subtypeName, L"I420");
+            else if (subtype == MFVideoFormat_P010)   wcscpy(subtypeName, L"P010");
+            else if (subtype == MFVideoFormat_P016)   wcscpy(subtypeName, L"P016");
+            else if (subtype == MFVideoFormat_YUY2)   wcscpy(subtypeName, L"YUY2");
+            else if (subtype == MFVideoFormat_AYUV)   wcscpy(subtypeName, L"AYUV");
+            else {
+                wchar_t* guidStr = nullptr;
+                if (SUCCEEDED(StringFromCLSID(subtype, &guidStr))) {
+                    wcscpy(subtypeName, guidStr);
+                    CoTaskMemFree(guidStr);
+                }
+            }
+            UINT32 natW = 0, natH = 0;
+            MFGetAttributeSize(availableType, MF_MT_FRAME_SIZE, &natW, &natH);
+            LOG_INFO("  Input type #%u: %S %ux%u", i, subtypeName, natW, natH);
+        }
+
+        if (SUCCEEDED(hr) && subtype == MFVideoFormat_NV12) {
+            MFSetAttributeSize(availableType, MF_MT_FRAME_SIZE, resW, resH);
+            MFSetAttributeRatio(availableType, MF_MT_FRAME_RATE, m_impl->fps, 1);
+            MFSetAttributeRatio(availableType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+            availableType->SetUINT32(MF_MT_INTERLACE_MODE,
+                                     MFVideoInterlace_MixedInterlaceOrProgressive);
+
+            hr = m_impl->mft->SetInputType(0, availableType, 0);
+            if (SUCCEEDED(hr)) {
+                m_impl->inputType = availableType;
+                LOG_INFO("  SetInputType OK (preferred NV12) @ %ux%u", resW, resH);
+                return true;
+            }
+            LOG_INFO("  SetInputType (preferred NV12 @ %ux%u) failed: 0x%08X", resW, resH, hr);
+        }
+        availableType->Release();
+    }
+
+    // Fall back to custom NV12 input types
+    for (auto& cfg : kInputConfigs) {
+        if (m_impl->inputType) { m_impl->inputType->Release(); m_impl->inputType = nullptr; }
+
+        hr = MFCreateMediaType(&m_impl->inputType);
+        if (FAILED(hr)) continue;
+
+        m_impl->inputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        m_impl->inputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+        MFSetAttributeSize(m_impl->inputType, MF_MT_FRAME_SIZE, resW, resH);
+        MFSetAttributeRatio(m_impl->inputType, MF_MT_FRAME_RATE, m_impl->fps, 1);
+        MFSetAttributeRatio(m_impl->inputType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        m_impl->inputType->SetUINT32(MF_MT_INTERLACE_MODE, cfg.interlaceMode);
+        if (cfg.setAllSamplesIndependent) {
+            m_impl->inputType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
+        }
+
+        hr = m_impl->mft->SetInputType(0, m_impl->inputType, 0);
+        if (SUCCEEDED(hr)) {
+            LOG_INFO("  SetInputType OK (custom NV12) @ %ux%u", resW, resH);
+            return true;
+        }
+    }
+
+    if (m_impl->inputType) { m_impl->inputType->Release(); m_impl->inputType = nullptr; }
+    return false;
+}
+
+bool MfVideoEncoder::TrySetOutputType(uint32_t resW, uint32_t resH) {
+    HRESULT hr;
+
+    struct OutCfg { bool setBitrate; bool setProfileLevel; };
+    static const OutCfg kOutCfgs[] = {
+        { false, false },
+        { true,  false },
+        { true,  true  },
+    };
+
+    for (auto& oc : kOutCfgs) {
         if (m_impl->outputType) { m_impl->outputType->Release(); m_impl->outputType = nullptr; }
 
         hr = MFCreateMediaType(&m_impl->outputType);
@@ -529,192 +735,105 @@ bool MfVideoEncoder::ConfigureMediaTypes() {
             m_impl->codecType == 1 ? MFVideoFormat_HEVC : MFVideoFormat_H264);
         MFSetAttributeSize(m_impl->outputType, MF_MT_FRAME_SIZE, resW, resH);
         MFSetAttributeRatio(m_impl->outputType, MF_MT_FRAME_RATE, m_impl->fps, 1);
-        {
-            uint32_t minBr = ComputeMinBitrate(resW, resH, m_impl->fps);
-            if (m_impl->bitrate < minBr) {
-                LOG_WARNING("Bitrate %u bps too low for %ux%u@%u fps, "
-                           "increasing to %u bps to prevent encoder downscale",
-                           m_impl->bitrate, resW, resH, m_impl->fps, minBr);
-                m_impl->bitrate = minBr;
-            }
-        }
-        m_impl->outputType->SetUINT32(MF_MT_AVG_BITRATE, m_impl->bitrate);
         m_impl->outputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
         MFSetAttributeRatio(m_impl->outputType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
-        // Set codec level to support high resolutions.
-        // H.264 Levels 4.x cap at ~1920x1088; Level 5.0+ required above that.
-        // HEVC has its own level system but MF_MT_MPEG2_LEVEL uses eAVEncH265VLevel.
-        if (m_impl->codecType == 1) {
-            // HEVC: Use Level 5.0 for up to 4096x2176@60, Main Profile
-            m_impl->outputType->SetUINT32(MF_MT_MPEG2_LEVEL,
-                                          static_cast<UINT32>(eAVEncH265VLevel5));
-            m_impl->outputType->SetUINT32(MF_MT_MPEG2_PROFILE,
-                                          static_cast<UINT32>(1)); // Main Profile
-        } else {
-            // H.264 level based on frame size (MaxFS in macroblocks) and throughput (MaxMBPS)
-            uint32_t mbW = (resW + 15) / 16;
-            uint32_t mbH = (resH + 15) / 16;
-            uint32_t mbPerFrame = mbW * mbH;
-            eAVEncH264VLevel h264Level;
-            if (mbPerFrame <= 8160) {
-                uint64_t mbPerSec = static_cast<uint64_t>(mbPerFrame) * m_impl->fps;
+        if (oc.setBitrate) {
+            uint32_t minBr = ComputeMinBitrate(resW, resH, m_impl->fps);
+            if (m_impl->bitrate < minBr) {
+                LOG_WARNING("Bitrate %u too low for %ux%u, increasing to %u",
+                           m_impl->bitrate, resW, resH, minBr);
+                m_impl->bitrate = minBr;
+            }
+            m_impl->outputType->SetUINT32(MF_MT_AVG_BITRATE, m_impl->bitrate);
+        }
+
+        if (oc.setProfileLevel) {
+            if (m_impl->codecType == 1) {
+                m_impl->outputType->SetUINT32(MF_MT_MPEG2_LEVEL,
+                                              static_cast<UINT32>(eAVEncH265VLevel5));
+                m_impl->outputType->SetUINT32(MF_MT_MPEG2_PROFILE,
+                                              static_cast<UINT32>(1)); // eAVEncH265VProfile_Main
+            } else {
+                uint32_t mbW = (resW + 15) / 16;
+                uint32_t mbH = (resH + 15) / 16;
+                uint32_t mbPerSec = static_cast<uint32_t>(
+                    static_cast<uint64_t>(mbW) * mbH * m_impl->fps);
+                eAVEncH264VLevel h264Level;
                 if (mbPerSec <= 245760)      h264Level = eAVEncH264VLevel4;
                 else if (mbPerSec <= 522240) h264Level = eAVEncH264VLevel4_2;
                 else                          h264Level = eAVEncH264VLevel5;
-            } else {
-                h264Level = eAVEncH264VLevel5;
-            }
-            m_impl->outputType->SetUINT32(MF_MT_MPEG2_LEVEL, static_cast<UINT32>(h264Level));
-            if (h264Level >= eAVEncH264VLevel5) {
-                m_impl->outputType->SetUINT32(MF_MT_MPEG2_PROFILE,
-                                              static_cast<UINT32>(100)); // High Profile
+                m_impl->outputType->SetUINT32(MF_MT_MPEG2_LEVEL, static_cast<UINT32>(h264Level));
+                if (h264Level >= eAVEncH264VLevel5) {
+                    m_impl->outputType->SetUINT32(MF_MT_MPEG2_PROFILE,
+                                                  static_cast<UINT32>(100)); // High Profile
+                }
             }
         }
 
         hr = m_impl->mft->SetOutputType(0, m_impl->outputType, 0);
-        if (FAILED(hr)) {
-            LOG_INFO("  Encoder SetOutputType rejected %ux%u: 0x%08X", resW, resH, hr);
-            continue;
-        }
-
-        // Read back actual frame size the encoder committed to
-        {
-            UINT32 actualW = 0, actualH = 0;
-            MFGetAttributeSize(m_impl->outputType, MF_MT_FRAME_SIZE, &actualW, &actualH);
-            if (actualW != resW || actualH != resH) {
-                LOG_WARNING("  Encoder changed output from %ux%u to %ux%u",
-                           resW, resH, actualW, actualH);
-            }
-        }
-
-        // --- Set input type at same resolution ---
-        if (m_impl->inputType) { m_impl->inputType->Release(); m_impl->inputType = nullptr; }
-        bool inputOk = false;
-
-        // Try preferred NV12 input types from the MFT first
-        for (DWORD i = 0; i < 16; ++i) {
-            IMFMediaType* availableType = nullptr;
-            hr = m_impl->mft->GetInputAvailableType(0, i, &availableType);
-            if (FAILED(hr)) break;
-
-            GUID subtype = GUID_NULL;
-            hr = availableType->GetGUID(MF_MT_SUBTYPE, &subtype);
-            if (SUCCEEDED(hr) && subtype == MFVideoFormat_NV12) {
-                // Log native frame size before we override it
-                if (i < 3) {
-                    UINT32 natW = 0, natH = 0;
-                    MFGetAttributeSize(availableType, MF_MT_FRAME_SIZE, &natW, &natH);
-                    LOG_INFO("  Input type #%u native frame size: %ux%u", i, natW, natH);
-                }
-
-                MFSetAttributeSize(availableType, MF_MT_FRAME_SIZE, resW, resH);
-                MFSetAttributeRatio(availableType, MF_MT_FRAME_RATE, m_impl->fps, 1);
-                MFSetAttributeRatio(availableType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-                availableType->SetUINT32(MF_MT_INTERLACE_MODE,
-                                         MFVideoInterlace_MixedInterlaceOrProgressive);
-
-                hr = m_impl->mft->SetInputType(0, availableType, 0);
-                if (SUCCEEDED(hr)) {
-                    m_impl->inputType = availableType;
-                    inputOk = true;
-                    break;
-                }
-            }
-            availableType->Release();
-        }
-
-        // Fall back to custom NV12 input types
-        if (!inputOk) {
-            for (auto& cfg : kInputConfigs) {
-                if (m_impl->inputType) { m_impl->inputType->Release(); m_impl->inputType = nullptr; }
-
-                hr = MFCreateMediaType(&m_impl->inputType);
-                if (FAILED(hr)) continue;
-
-                m_impl->inputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-                m_impl->inputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-                MFSetAttributeSize(m_impl->inputType, MF_MT_FRAME_SIZE, resW, resH);
-                MFSetAttributeRatio(m_impl->inputType, MF_MT_FRAME_RATE, m_impl->fps, 1);
-                MFSetAttributeRatio(m_impl->inputType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-                m_impl->inputType->SetUINT32(MF_MT_INTERLACE_MODE, cfg.interlaceMode);
-                if (cfg.setAllSamplesIndependent) {
-                    m_impl->inputType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-                }
-
-                hr = m_impl->mft->SetInputType(0, m_impl->inputType, 0);
-                if (SUCCEEDED(hr)) {
-                    inputOk = true;
-                    break;
-                }
-            }
-        }
-
-        if (!inputOk) {
-            LOG_INFO("  Encoder SetInputType rejected %ux%u", resW, resH);
-            // Don't recreate the MFT — just release the output type and try
-            // the next resolution rung. The caller iterates encoder candidates,
-            // so if all rungs fail the next candidate will be tried.
-            if (m_impl->outputType) { m_impl->outputType->Release(); m_impl->outputType = nullptr; }
-            continue;
-        }
-
-        // --- Both output and input accepted at this resolution ---
-        {
-            // Read back actual frame sizes the encoder committed to
-            UINT32 outW = 0, outH = 0, inW = 0, inH = 0;
-            if (m_impl->outputType)
-                MFGetAttributeSize(m_impl->outputType, MF_MT_FRAME_SIZE, &outW, &outH);
-            if (m_impl->inputType)
-                MFGetAttributeSize(m_impl->inputType, MF_MT_FRAME_SIZE, &inW, &inH);
-            LOG_INFO("Encoder type readback: input=%ux%u output=%ux%u (requested %ux%u)",
-                     inW, inH, outW, outH, resW, resH);
-        }
-
-        if (resW != m_impl->width || resH != m_impl->height) {
-            LOG_WARNING("Encoder using %ux%u (requested %ux%u)",
-                       resW, resH, m_impl->width, m_impl->height);
-            m_impl->width = resW;
-            m_impl->height = resH;
-        } else {
-            LOG_INFO("%s encoder configured: %ux%u @ %u fps %u bps",
-                     m_impl->codecType == 1 ? "HEVC" : "H.264",
-                     resW, resH, m_impl->fps, m_impl->bitrate);
-        }
-
-        // Enable low latency mode
-        IMFAttributes* attrs = nullptr;
-        hr = m_impl->mft->GetAttributes(&attrs);
         if (SUCCEEDED(hr)) {
-            attrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
-            attrs->Release();
+            return true;
         }
-
-        m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-
-        // Read back codec data (SPS/PPS) from the output type
-        if (m_impl->outputType) {
-            UINT32 blobSize = 0;
-            if (SUCCEEDED(m_impl->outputType->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER,
-                                                       nullptr, 0, &blobSize)) &&
-                blobSize > 0) {
-                m_impl->codecData.resize(blobSize);
-                if (SUCCEEDED(m_impl->outputType->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER,
-                                                           m_impl->codecData.data(),
-                                                           blobSize, &blobSize))) {
-                    LOG_INFO("Encoder codec data (SPS/PPS): %u bytes", blobSize);
-                } else {
-                    m_impl->codecData.clear();
-                }
-            }
+        if (!oc.setBitrate && !oc.setProfileLevel) {
+            LOG_INFO("  SetOutputType rejected bare %ux%u: 0x%08X", resW, resH, hr);
         }
-
-        return true;
     }
 
-    LOG_ERROR("No resolution in ladder accepted by encoder (tried %zu rungs from %ux%u)",
-              ladder.size(), m_impl->width, m_impl->height);
+    if (m_impl->outputType) { m_impl->outputType->Release(); m_impl->outputType = nullptr; }
     return false;
+}
+
+void MfVideoEncoder::FinalizeMediaTypes(uint32_t resW, uint32_t resH) {
+    HRESULT hr;
+
+    {
+        UINT32 outW = 0, outH = 0, inW = 0, inH = 0;
+        if (m_impl->outputType)
+            MFGetAttributeSize(m_impl->outputType, MF_MT_FRAME_SIZE, &outW, &outH);
+        if (m_impl->inputType)
+            MFGetAttributeSize(m_impl->inputType, MF_MT_FRAME_SIZE, &inW, &inH);
+        LOG_INFO("Encoder type readback: input=%ux%u output=%ux%u (requested %ux%u)",
+                 inW, inH, outW, outH, resW, resH);
+    }
+
+    if (resW != m_impl->width || resH != m_impl->height) {
+        LOG_WARNING("Encoder using %ux%u (requested %ux%u)",
+                   resW, resH, m_impl->width, m_impl->height);
+        m_impl->width = resW;
+        m_impl->height = resH;
+    } else {
+        LOG_INFO("%s encoder configured: %ux%u @ %u fps %u bps",
+                 m_impl->codecType == 1 ? "HEVC" : "H.264",
+                 resW, resH, m_impl->fps, m_impl->bitrate);
+    }
+
+    // Enable low latency mode
+    IMFAttributes* attrs = nullptr;
+    hr = m_impl->mft->GetAttributes(&attrs);
+    if (SUCCEEDED(hr)) {
+        attrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
+        attrs->Release();
+    }
+
+    m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+    // Read back codec data (SPS/PPS) from the output type
+    if (m_impl->outputType) {
+        UINT32 blobSize = 0;
+        if (SUCCEEDED(m_impl->outputType->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER,
+                                                   nullptr, 0, &blobSize)) &&
+            blobSize > 0) {
+            m_impl->codecData.resize(blobSize);
+            if (SUCCEEDED(m_impl->outputType->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER,
+                                                       m_impl->codecData.data(),
+                                                       blobSize, &blobSize))) {
+                LOG_INFO("Encoder codec data (SPS/PPS): %u bytes", blobSize);
+            } else {
+                m_impl->codecData.clear();
+            }
+        }
+    }
 }
 
 // Simple BGRA to NV12 conversion
@@ -746,6 +865,57 @@ static void BgraToNv12(const uint8_t* bgra, uint32_t width, uint32_t height,
             }
         }
     }
+}
+
+// Parallel BGRA→NV12: split rows across CPU cores.
+// Y-plane rows are independent; UV rows are paired (4:2:0), so each chunk
+// starts at an even row to avoid inter-thread UV conflicts.
+static void BgraToNv12Chunk(const uint8_t* bgra, uint32_t width, uint32_t height,
+                            uint32_t startRow, uint32_t endRow,
+                            uint8_t* yPlane, uint8_t* uvPlane) {
+    for (uint32_t row = startRow; row < endRow; ++row) {
+        for (uint32_t col = 0; col < width; ++col) {
+            const uint8_t* src = bgra + (row * width + col) * 4;
+            uint8_t b = src[0], g = src[1], r = src[2];
+            yPlane[row * width + col] = static_cast<uint8_t>((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            if (row % 2 == 0 && col % 2 == 0) {
+                uint8_t u = static_cast<uint8_t>((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                uint8_t v = static_cast<uint8_t>((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                size_t uvIndex = (row / 2) * (width / 2) + (col / 2);
+                uvPlane[uvIndex * 2] = u;
+                uvPlane[uvIndex * 2 + 1] = v;
+            }
+        }
+    }
+}
+
+static void BgraToNv12Parallel(const uint8_t* bgra, uint32_t width, uint32_t height,
+                               std::vector<uint8_t>& nv12) {
+    uint32_t ySize = width * height;
+    uint32_t uvSize = width * height / 4;
+    nv12.resize(ySize + uvSize * 2);
+    uint8_t* yPlane = nv12.data();
+    uint8_t* uvPlane = nv12.data() + ySize;
+
+    unsigned int nThreads = std::thread::hardware_concurrency();
+    if (nThreads < 2 || height < 120) {
+        // Single-threaded for small frames or single-core
+        BgraToNv12Chunk(bgra, width, height, 0, height, yPlane, uvPlane);
+        return;
+    }
+    if (nThreads > 8) nThreads = 8;
+
+    uint32_t rowsPerThread = ((height / nThreads) + 1) & ~1u; // round up to even
+    std::vector<std::future<void>> futures;
+
+    for (unsigned int t = 0; t < nThreads; ++t) {
+        uint32_t start = t * rowsPerThread;
+        if (start >= height) break;
+        uint32_t end = (start + rowsPerThread < height) ? start + rowsPerThread : height;
+        futures.push_back(std::async(std::launch::async,
+            BgraToNv12Chunk, bgra, width, height, start, end, yPlane, uvPlane));
+    }
+    for (auto& f : futures) f.get();
 }
 
 bool MfVideoEncoder::EncodeFrame(const uint8_t* rawFrame, uint32_t width, uint32_t height,
@@ -808,57 +978,290 @@ static void DownscaleBgra(const uint8_t* src, uint32_t srcW, uint32_t srcH,
     }
 }
 
-// Upload NV12 data to a D3D11 texture and create a GPU-backed IMFSample.
+// Upload NV12 data to a cached D3D11 texture and create a GPU-backed IMFSample.
+// The texture is cached and reused across frames to avoid GPU allocation overhead.
 static bool CreateGpuSample(ID3D11Device* device, ID3D11DeviceContext* context,
+                            ID3D11Texture2D*& cachedTex, uint32_t& cachedW, uint32_t& cachedH,
                             const uint8_t* nv12Data, uint32_t width, uint32_t height,
                             IMFSample** outSample) {
     *outSample = nullptr;
 
-    D3D11_TEXTURE2D_DESC texDesc = {};
-    texDesc.Width = width;
-    texDesc.Height = height;
-    texDesc.MipLevels = 1;
-    texDesc.ArraySize = 1;
-    texDesc.Format = DXGI_FORMAT_NV12;
-    texDesc.SampleDesc.Count = 1;
-    texDesc.Usage = D3D11_USAGE_DYNAMIC;
-    texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    texDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    // Recreate texture only if dimensions changed
+    if (!cachedTex || cachedW != width || cachedH != height) {
+        if (cachedTex) cachedTex->Release();
 
-    ID3D11Texture2D* texture = nullptr;
-    HRESULT hr = device->CreateTexture2D(&texDesc, nullptr, &texture);
-    if (FAILED(hr)) return false;
+        D3D11_TEXTURE2D_DESC texDesc = {};
+        texDesc.Width = width;
+        texDesc.Height = height;
+        texDesc.MipLevels = 1;
+        texDesc.ArraySize = 1;
+        texDesc.Format = DXGI_FORMAT_NV12;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.Usage = D3D11_USAGE_DYNAMIC;
+        texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        HRESULT hr = device->CreateTexture2D(&texDesc, nullptr, &cachedTex);
+        if (FAILED(hr)) {
+            cachedTex = nullptr;
+            return false;
+        }
+        cachedW = width;
+        cachedH = height;
+    }
 
     // Upload Y plane (subresource 0)
     {
         D3D11_MAPPED_SUBRESOURCE mapped;
-        hr = context->Map(texture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (FAILED(hr)) { texture->Release(); return false; }
+        HRESULT hr = context->Map(cachedTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (FAILED(hr)) return false;
         const uint8_t* src = nv12Data;
         uint8_t* dst = static_cast<uint8_t*>(mapped.pData);
         for (uint32_t row = 0; row < height; ++row)
             memcpy(dst + row * mapped.RowPitch, src + row * width, width);
-        context->Unmap(texture, 0);
+        context->Unmap(cachedTex, 0);
     }
 
     // Upload UV plane (subresource 1)
     {
         D3D11_MAPPED_SUBRESOURCE mapped;
-        hr = context->Map(texture, 1, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (FAILED(hr)) { texture->Release(); return false; }
+        HRESULT hr = context->Map(cachedTex, 1, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (FAILED(hr)) return false;
         const uint8_t* src = nv12Data + static_cast<size_t>(width) * height;
         uint8_t* dst = static_cast<uint8_t*>(mapped.pData);
         uint32_t uvH = height / 2;
         for (uint32_t row = 0; row < uvH; ++row)
             memcpy(dst + row * mapped.RowPitch, src + row * width, width);
-        context->Unmap(texture, 1);
+        context->Unmap(cachedTex, 1);
     }
 
-    // Wrap texture as IMFMediaBuffer via DXGI surface buffer
+    // Wrap texture as IMFMediaBuffer via DXGI surface buffer (Increments refcount)
     IMFMediaBuffer* mediaBuffer = nullptr;
-    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture, 0, FALSE, &mediaBuffer);
-    texture->Release();
+    HRESULT hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), cachedTex, 0, FALSE, &mediaBuffer);
     if (FAILED(hr)) return false;
+
+    hr = MFCreateSample(outSample);
+    if (FAILED(hr)) { mediaBuffer->Release(); return false; }
+
+    (*outSample)->AddBuffer(mediaBuffer);
+    mediaBuffer->Release();
+    return true;
+}
+
+// --- GPU hardware video processor: BGRA → NV12 conversion ---
+// Uses D3D11 VideoProcessor API for hardware-accelerated color-space conversion,
+// eliminating the CPU BGRA→NV12 bottleneck (~60M integer ops/frame at 2560x1600).
+
+bool MfVideoEncoder::InitVideoProcessor(MfVideoEncoder::Impl* impl, uint32_t width, uint32_t height) {
+    if (impl->vpEnumerator && impl->vpWidth == width && impl->vpHeight == height)
+        return true; // already initialized for this resolution
+
+    // Tear down old resources
+    if (impl->vpInputView)  { impl->vpInputView->Release();  impl->vpInputView = nullptr; }
+    if (impl->vpOutputView) { impl->vpOutputView->Release(); impl->vpOutputView = nullptr; }
+    if (impl->videoProcessor) { impl->videoProcessor->Release(); impl->videoProcessor = nullptr; }
+    if (impl->vpEnumerator) { impl->vpEnumerator->Release(); impl->vpEnumerator = nullptr; }
+    if (impl->videoContext) { impl->videoContext->Release(); impl->videoContext = nullptr; }
+    if (impl->videoDevice)  { impl->videoDevice->Release();  impl->videoDevice = nullptr; }
+    if (impl->bgraGpuTex)   { impl->bgraGpuTex->Release();   impl->bgraGpuTex = nullptr; }
+    if (impl->nv12GpuTex)   { impl->nv12GpuTex->Release();   impl->nv12GpuTex = nullptr; }
+
+    HRESULT hr;
+
+    // Obtain D3D11 video device & context from the existing D3D device
+    hr = impl->d3dDevice->QueryInterface(IID_PPV_ARGS(&impl->videoDevice));
+    if (FAILED(hr)) return false;
+    hr = impl->d3dContext->QueryInterface(IID_PPV_ARGS(&impl->videoContext));
+    if (FAILED(hr)) return false;
+
+    // Create video processor enumerator
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC vpDesc = {};
+    vpDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    vpDesc.InputFrameRate.Numerator = impl->fps;
+    vpDesc.InputFrameRate.Denominator = 1;
+    vpDesc.InputWidth = width;
+    vpDesc.InputHeight = height;
+    vpDesc.OutputFrameRate.Numerator = impl->fps;
+    vpDesc.OutputFrameRate.Denominator = 1;
+    vpDesc.OutputWidth = width;
+    vpDesc.OutputHeight = height;
+    vpDesc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+
+    hr = impl->videoDevice->CreateVideoProcessorEnumerator(&vpDesc, &impl->vpEnumerator);
+    if (FAILED(hr)) return false;
+
+    hr = impl->videoDevice->CreateVideoProcessor(impl->vpEnumerator, 0, &impl->videoProcessor);
+    if (FAILED(hr)) return false;
+
+    // Create cached BGRA input texture (dynamic, CPU-writable for upload)
+    {
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        hr = impl->d3dDevice->CreateTexture2D(&desc, nullptr, &impl->bgraGpuTex);
+        if (FAILED(hr)) return false;
+    }
+
+    // Create cached NV12 output texture (default, GPU-only — video processor target)
+    {
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_NV12;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        hr = impl->d3dDevice->CreateTexture2D(&desc, nullptr, &impl->nv12GpuTex);
+        if (FAILED(hr)) return false;
+    }
+
+    // Create video processor input view (BGRA)
+    {
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
+        ivDesc.FourCC = 0;
+        ivDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        ivDesc.Texture2D.MipSlice = 0;
+        ivDesc.Texture2D.ArraySlice = 0;
+        hr = impl->videoDevice->CreateVideoProcessorInputView(
+            impl->bgraGpuTex, impl->vpEnumerator, &ivDesc, &impl->vpInputView);
+        if (FAILED(hr)) return false;
+    }
+
+    // Create video processor output view (NV12)
+    {
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc = {};
+        ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        hr = impl->videoDevice->CreateVideoProcessorOutputView(
+            impl->nv12GpuTex, impl->vpEnumerator, &ovDesc, &impl->vpOutputView);
+        if (FAILED(hr)) return false;
+    }
+
+    impl->vpWidth = width;
+    impl->vpHeight = height;
+    return true;
+}
+
+// Convert BGRA raw frame to NV12 using GPU video processor,
+// returning an IMFSample backed by the GPU NV12 texture.
+bool MfVideoEncoder::ConvertBgraToNv12Gpu(MfVideoEncoder::Impl* impl,
+                                 const uint8_t* bgraData, uint32_t width, uint32_t height,
+                                 IMFSample** outSample) {
+    *outSample = nullptr;
+
+    // Skip GPU path if it was already validated and found broken
+    if (impl->vpValidated && !impl->vpWorking)
+        return false;
+
+    if (!InitVideoProcessor(impl, width, height))
+        return false;
+
+    // Upload BGRA data to GPU texture
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = impl->d3dContext->Map(impl->bgraGpuTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) return false;
+
+    size_t rowSize = width * 4;
+    if (mapped.RowPitch == rowSize) {
+        memcpy(mapped.pData, bgraData, rowSize * height);
+    } else {
+        for (uint32_t row = 0; row < height; ++row)
+            memcpy(static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch,
+                   bgraData + row * rowSize, rowSize);
+    }
+    impl->d3dContext->Unmap(impl->bgraGpuTex, 0);
+
+    // Set stream source rect to full frame
+    RECT srcRect = { 0, 0, (LONG)width, (LONG)height };
+    impl->videoContext->VideoProcessorSetStreamSourceRect(impl->videoProcessor, 0, TRUE, &srcRect);
+    impl->videoContext->VideoProcessorSetStreamDestRect(impl->videoProcessor, 0, TRUE, &srcRect);
+
+    // BGRA → NV12 via hardware video processor
+    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+    stream.Enable = TRUE;
+    stream.OutputIndex = 0;
+    stream.InputFrameOrField = 0;
+    stream.PastFrames = 0;
+    stream.FutureFrames = 0;
+    stream.ppPastSurfaces = nullptr;
+    stream.pInputSurface = impl->vpInputView;
+    stream.ppFutureSurfaces = nullptr;
+
+    hr = impl->videoContext->VideoProcessorBlt(
+        impl->videoProcessor, impl->vpOutputView, 0, 1, &stream);
+    if (FAILED(hr)) return false;
+
+    // Flush the D3D11 immediate context so the GPU finishes writing the NV12
+    // texture before we wrap it for the encoder.  Without this the encoder
+    // may sample an incomplete / all-zero surface.
+    impl->d3dContext->Flush();
+
+    // Wrap NV12 GPU texture as IMFMediaBuffer
+    IMFMediaBuffer* mediaBuffer = nullptr;
+    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), impl->nv12GpuTex,
+                                    0, FALSE, &mediaBuffer);
+    if (FAILED(hr)) return false;
+
+    // One-time validation: read back a few Y-plane pixels to detect
+    // a misconfigured video processor that produces all-black output.
+    if (!impl->vpValidated) {
+        bool vpOk = false;
+        uint32_t nonZeroCount = 0;
+        D3D11_TEXTURE2D_DESC stagingDesc = {};
+        stagingDesc.Width  = width;
+        stagingDesc.Height = height;
+        stagingDesc.MipLevels = 1;
+        stagingDesc.ArraySize = 1;
+        stagingDesc.Format = DXGI_FORMAT_NV12;
+        stagingDesc.SampleDesc.Count = 1;
+        stagingDesc.Usage = D3D11_USAGE_STAGING;
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        ID3D11Texture2D* stagingTex = nullptr;
+        if (SUCCEEDED(impl->d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &stagingTex))) {
+            impl->d3dContext->CopyResource(stagingTex, impl->nv12GpuTex);
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            if (SUCCEEDED(impl->d3dContext->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+                const uint8_t* p = static_cast<const uint8_t*>(mapped.pData);
+                size_t checkBytes = (size_t)width * height;
+                if (checkBytes > 64) checkBytes = 64;
+                for (size_t i = 0; i < checkBytes; ++i)
+                    if (p[i] != 0) ++nonZeroCount;
+                impl->d3dContext->Unmap(stagingTex, 0);
+                vpOk = (nonZeroCount > 0);
+            }
+            stagingTex->Release();
+        }
+
+        impl->vpValidated = true;
+        impl->vpWorking = vpOk;
+        if (!vpOk) {
+            LOG_WARNING("GPU video processor produced all-black NV12 output, "
+                        "falling back to CPU conversion");
+            mediaBuffer->Release();
+            // Tear down VP resources so they aren't reused
+            if (impl->vpInputView)  { impl->vpInputView->Release();  impl->vpInputView = nullptr; }
+            if (impl->vpOutputView) { impl->vpOutputView->Release(); impl->vpOutputView = nullptr; }
+            if (impl->videoProcessor) { impl->videoProcessor->Release(); impl->videoProcessor = nullptr; }
+            if (impl->vpEnumerator) { impl->vpEnumerator->Release(); impl->vpEnumerator = nullptr; }
+            if (impl->videoContext) { impl->videoContext->Release(); impl->videoContext = nullptr; }
+            if (impl->videoDevice)  { impl->videoDevice->Release();  impl->videoDevice = nullptr; }
+            if (impl->bgraGpuTex)   { impl->bgraGpuTex->Release();   impl->bgraGpuTex = nullptr; }
+            if (impl->nv12GpuTex)   { impl->nv12GpuTex->Release();   impl->nv12GpuTex = nullptr; }
+            impl->vpWidth = impl->vpHeight = 0;
+            return false;
+        }
+        LOG_INFO("GPU video processor validated (%u of %u Y pixels non-zero)",
+                 nonZeroCount, (uint32_t)(width * height < 64 ? width * height : 64));
+    }
 
     hr = MFCreateSample(outSample);
     if (FAILED(hr)) { mediaBuffer->Release(); return false; }
@@ -881,46 +1284,41 @@ bool MfVideoEncoder::ProcessInput(const uint8_t* rawFrame, uint32_t width, uint3
         height = m_impl->height;
     }
 
-    // Convert BGRA to NV12
-    std::vector<uint8_t> nv12;
-    BgraToNv12(frameData, width, height, nv12);
-
+    // --- Build IMFSample from BGRA input ---
+    // Use CPU BGRA→NV12 conversion with a CPU-backed media buffer.
+    // GPU texture upload is skipped because the current encoder
+    // (HEVCVideoExtensionEncoder) is a software implementation:
+    // uploading to GPU would just cause an internal GPU→CPU readback.
     IMFSample* sample = nullptr;
     HRESULT hr;
+    uint32_t nv12Size = width * height * 3 / 2;
 
-    if (m_impl->d3dDevice && m_impl->deviceManager) {
-        hr = CreateGpuSample(m_impl->d3dDevice, m_impl->d3dContext,
-                            nv12.data(), width, height, &sample);
-        if (FAILED(hr)) {
-            LOG_WARNING("CreateGpuSample failed: 0x%08X, falling back to CPU", hr);
-            sample = nullptr;
-        }
-    }
+    // CPU BGRA→NV12 conversion (parallelized across cores)
+    m_impl->nv12Buffer.resize(nv12Size);
+    BgraToNv12Parallel(frameData, width, height, m_impl->nv12Buffer);
 
-    // CPU fallback
-    if (!sample) {
-        IMFMediaBuffer* mediaBuffer = nullptr;
-        hr = MFCreateMemoryBuffer(static_cast<DWORD>(nv12.size()), &mediaBuffer);
-        if (FAILED(hr)) return false;
+    // CPU memory buffer — avoids GPU upload/download round-trip
+    IMFMediaBuffer* mediaBuffer = nullptr;
+    hr = MFCreateMemoryBuffer(static_cast<DWORD>(nv12Size), &mediaBuffer);
+    if (FAILED(hr)) return false;
 
-        BYTE* bufferData = nullptr;
-        hr = mediaBuffer->Lock(&bufferData, nullptr, nullptr);
-        if (FAILED(hr)) {
-            mediaBuffer->Release();
-            return false;
-        }
-        memcpy(bufferData, nv12.data(), nv12.size());
-        mediaBuffer->Unlock();
-        mediaBuffer->SetCurrentLength(static_cast<DWORD>(nv12.size()));
-
-        hr = MFCreateSample(&sample);
-        if (FAILED(hr)) {
-            mediaBuffer->Release();
-            return false;
-        }
-        sample->AddBuffer(mediaBuffer);
+    BYTE* bufferData = nullptr;
+    hr = mediaBuffer->Lock(&bufferData, nullptr, nullptr);
+    if (FAILED(hr)) {
         mediaBuffer->Release();
+        return false;
     }
+    memcpy(bufferData, m_impl->nv12Buffer.data(), nv12Size);
+    mediaBuffer->Unlock();
+    mediaBuffer->SetCurrentLength(static_cast<DWORD>(nv12Size));
+
+    hr = MFCreateSample(&sample);
+    if (FAILED(hr)) {
+        mediaBuffer->Release();
+        return false;
+    }
+    sample->AddBuffer(mediaBuffer);
+    mediaBuffer->Release();
 
     // Set timestamp
     LONGLONG duration = 10000000LL / m_impl->fps; // 100ns units

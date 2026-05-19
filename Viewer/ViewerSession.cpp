@@ -9,6 +9,7 @@
 #include "Common/Utils/Logger.h"
 #include "Common/Utils/Timer.h"
 #include "Common/Utils/DebugScreenshot.h"
+#include <thread>
 
 ViewerSession::ViewerSession() {}
 
@@ -314,10 +315,14 @@ void ViewerSession::VideoDecodeThread() {
             // DEBUG: Save decoded RGBA frame to BMP every ~5 seconds (up to 10)
             auto now = Timer::NowMs();
             if (debugSaveCount < 10 && (debugSaveCount == 0 || now - lastDebugSaveMs >= 5000)) {
-                SaveBmp("viewer_decoded", m_latestFrame.data.data(),
-                        m_latestFrame.width, m_latestFrame.height, false);
                 lastDebugSaveMs = now;
                 debugSaveCount++;
+                std::vector<uint8_t> copyForSave = m_latestFrame.data;
+                std::thread([](std::vector<uint8_t> data, uint32_t w, uint32_t h, uint32_t cnt) {
+                    char prefix[64];
+                    snprintf(prefix, sizeof(prefix), "viewer_decoded_%u", cnt);
+                    SaveBmp(prefix, data.data(), w, h, false);
+                }, std::move(copyForSave), m_latestFrame.width, m_latestFrame.height, debugSaveCount).detach();
             }
         } else {
             fails++;

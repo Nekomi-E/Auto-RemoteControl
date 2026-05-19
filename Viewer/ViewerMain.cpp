@@ -4,6 +4,7 @@
 #include "ViewerWindow.h"
 #include "ViewerSession.h"
 #include <d3d11.h>
+#include <timeapi.h>
 
 // Global references for the window procedure
 ViewerWindow* g_window = nullptr;
@@ -11,6 +12,8 @@ ViewerSession* g_session = nullptr;
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     (void)nCmdShow;
+
+    timeBeginPeriod(1);  // 1ms timer resolution for precise Sleep at 60fps
 
     // Declare DPI awareness so GetClientRect / SPI_GETWORKAREA return physical
     // pixels. Without this, on high-DPI displays the swap chain is created at
@@ -112,6 +115,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     CoUninitialize();
     WSACleanup();
+    timeEndPeriod(1);
 
     return 0;
 }

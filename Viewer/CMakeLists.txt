@@ -23,5 +23,6 @@ target_link_libraries(Viewer PRIVATE
     strmiids
     ole32
     user32 gdi32
+    winmm
 )
 set_target_properties(Viewer PROPERTIES FOLDER "Viewer")

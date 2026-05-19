@@ -2,8 +2,10 @@
 #include "Common/Utils/Logger.h"
 #include "Common/Utils/Config.h"
 #include "AgentSession.h"
+#include <timeapi.h>
 
 int main(int argc, char* argv[]) {
+    timeBeginPeriod(1);  // 1ms timer resolution for precise Sleep at 60fps
     Logger::Instance().SetLevel(LogLevel::Debug);
 
     auto config = Config::ParseAgentArgs(argc, argv);
@@ -29,5 +31,6 @@ int main(int argc, char* argv[]) {
     session.Run();
 
     LOG_INFO("Agent stopped.");
+    timeEndPeriod(1);
     return 0;
 }

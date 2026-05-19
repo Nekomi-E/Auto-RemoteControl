@@ -26,11 +26,11 @@ struct EncoderManager::Impl {
         int64_t timestampMs = 0;
     };
 
-    ThreadSafeQueue<RawVideoFrame> videoInputQueue{8};
+    ThreadSafeQueue<RawVideoFrame> videoInputQueue{16};
     ThreadSafeQueue<RawAudioFrame> audioInputQueue{16};
 
     // Encoded output queues
-    ThreadSafeQueue<EncodedFrame> videoOutputQueue{16};
+    ThreadSafeQueue<EncodedFrame> videoOutputQueue{32};
     ThreadSafeQueue<EncodedFrame> audioOutputQueue{32};
 
     // Worker threads
@@ -51,7 +51,7 @@ struct EncoderManager::Impl {
     uint32_t frameWidth = 1920;
     uint32_t frameHeight = 1080;
     uint32_t targetBitrate = 0;       // 0 = auto
-    uint32_t targetFps = 30;
+    uint32_t targetFps = 60;
 };
 
 EncoderManager::EncoderManager() : m_impl(std::make_unique<Impl>()) {}
@@ -165,11 +165,11 @@ void EncoderManager::Stop() {
     if (m_impl->audioEncoder) m_impl->audioEncoder->Shutdown();
 }
 
-void EncoderManager::SubmitVideoFrame(const std::vector<uint8_t>& rawData,
+void EncoderManager::SubmitVideoFrame(std::vector<uint8_t> rawData,
                                        uint32_t width, uint32_t height,
                                        int64_t timestampMs) {
     Impl::RawVideoFrame rf;
-    rf.data = rawData;
+    rf.data = std::move(rawData);
     rf.width = width;
     rf.height = height;
     rf.timestampMs = timestampMs;

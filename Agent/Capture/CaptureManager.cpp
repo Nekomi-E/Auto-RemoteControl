@@ -11,7 +11,7 @@ struct CaptureManager::Impl {
     std::unique_ptr<WasapiAudioCapture> audioCapture;
     std::vector<MonitorDesc> monitors;
 
-    uint32_t targetFps = 30;
+    uint32_t targetFps = 60;
     std::atomic<bool> running{false};
 
     // Stats
@@ -112,6 +112,7 @@ bool CaptureManager::Initialize(uint32_t targetFps) {
         LOG_ERROR("Failed to initialize DXGI screen capture");
         return false;
     }
+    m_impl->screenCapture->SetTargetFps(m_impl->targetFps);
 
     m_impl->monitors = m_impl->screenCapture->GetMonitors();
     LOG_INFO("Detected %zu monitor(s)", m_impl->monitors.size());

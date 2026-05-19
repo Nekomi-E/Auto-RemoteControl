@@ -125,18 +125,20 @@ void DxgiScreenCapture::Shutdown() {
 bool DxgiScreenCapture::AcquireFrame(CapturedFrame& outFrame) {
     if (m_monitors.empty()) return false;
 
-    // Pace to target framerate
+    // Pace to target framerate — sleep only the remaining budget so capture
+    // runs as close to the target rate as possible without busy-waiting.
     auto now = Timer::NowMs();
-    const int64_t frameInterval = 33; // ~30fps minimum interval
-    if (now - m_lastFrameTime < frameInterval) {
-        Sleep(1);
-        return false;
+    int64_t frameInterval = 1000 / m_targetFps;
+    int64_t elapsed = now - m_lastFrameTime;
+    if (elapsed < frameInterval) {
+        Sleep(static_cast<DWORD>(frameInterval - elapsed));
+        now = Timer::NowMs();
     }
-    m_lastFrameTime = now;
 
     // Capture primary monitor only (monitor 0)
     // Multi-monitor composition would require stitching frames before encoding
     if (AcquireFromMonitor(0, outFrame)) {
+        m_lastFrameTime = now;
         outFrame.timestampMs = now;
         return true;
     }
@@ -149,10 +151,18 @@ bool DxgiScreenCapture::AcquireFromMonitor(int index, CapturedFrame& outFrame) {
 
     IDXGIResource* frameResource = nullptr;
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
-    HRESULT hr = mc.duplication->AcquireNextFrame(0, &frameInfo, &frameResource);
+    HRESULT hr = DXGI_ERROR_WAIT_TIMEOUT;
+
+    // Retry a few times with a 1ms wait — at 60fps (16.67ms interval)
+    // the desktop may not have a fresh frame exactly when we ask.
+    for (int retry = 0; retry < 3; ++retry) {
+        hr = mc.duplication->AcquireNextFrame(0, &frameInfo, &frameResource);
+        if (hr != DXGI_ERROR_WAIT_TIMEOUT) break;
+        if (retry < 2) Sleep(1);
+    }
 
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        return false; // No new frame, normal
+        return false; // No new frame after retries, normal
     }
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         LOG_WARNING("DXGI access lost on monitor %d, reinitializing", index);
