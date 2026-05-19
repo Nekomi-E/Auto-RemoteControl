@@ -193,3 +193,7 @@ CaptureManager::Stats CaptureManager::GetStats() const {
 ID3D11Device* CaptureManager::GetD3DDevice() const {
     return m_impl->d3dDevice;
 }
+
+ID3D11DeviceContext* CaptureManager::GetD3DContext() const {
+    return m_impl->d3dContext;
+}

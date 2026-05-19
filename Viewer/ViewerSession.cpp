@@ -86,6 +86,7 @@ bool ViewerSession::SetRenderWindow(HWND hwnd) {
 void ViewerSession::Start() {
     m_running = true;
 
+    m_threads.emplace_back(&ViewerSession::RenderThread, this);
     m_threads.emplace_back(&ViewerSession::NetworkReceiveThread, this);
     m_threads.emplace_back(&ViewerSession::VideoDecodeThread, this);
     m_threads.emplace_back(&ViewerSession::InputSendThread, this);
@@ -126,8 +127,8 @@ void ViewerSession::RenderFrame() {
         }
     }
 
-    // Render overlay
-    m_overlay->Draw(m_network ? m_network->GetFps() : 0.0f,
+    // Render overlay — show actual decoded video FPS, not network packet rate
+    m_overlay->Draw(m_decodedFps,
                     m_network ? m_network->IsConnected() : false);
 
     // Present
@@ -137,8 +138,13 @@ void ViewerSession::RenderFrame() {
 void ViewerSession::OnResize(uint32_t width, uint32_t height) {
     m_windowWidth = width;
     m_windowHeight = height;
-    if (m_renderer) {
-        m_renderer->Resize(width, height);
+    // Defer the actual D3D11 resize to the render thread — calling ResizeBuffers
+    // from the main thread races with Present on the render thread.
+    {
+        std::lock_guard lock(m_renderMutex);
+        m_pendingResize = true;
+        m_pendingWidth = width;
+        m_pendingHeight = height;
     }
 }
 
@@ -236,6 +242,53 @@ void ViewerSession::OnRawInput(HRAWINPUT hRawInput) {
     }
 }
 
+void ViewerSession::RenderThread() {
+    LOG_INFO("[Render] Thread started");
+    int64_t lastFrameTime = Timer::NowMs();
+    uint32_t frameCount = 0;
+    int64_t lastStatsTime = lastFrameTime;
+    uint32_t lastDecodedCount = 0;
+
+    while (m_running) {
+        // Check for pending resize from the main thread
+        {
+            std::lock_guard lock(m_renderMutex);
+            if (m_pendingResize) {
+                if (m_renderer) {
+                    m_renderer->Resize(m_pendingWidth, m_pendingHeight);
+                }
+                m_pendingResize = false;
+            }
+        }
+
+        RenderFrame();
+        frameCount++;
+
+        // Pace to target frame rate (default 60fps)
+        auto now = Timer::NowMs();
+        int64_t targetInterval = 1000 / 60;
+        int64_t elapsed = now - lastFrameTime;
+        if (elapsed < targetInterval) {
+            Sleep(static_cast<DWORD>(targetInterval - elapsed));
+        }
+        lastFrameTime = Timer::NowMs();
+
+        // Periodic stats — report actual video FPS (decoded frames) vs render rate
+        if (now - lastStatsTime >= 5000) {
+            double renderFps = frameCount * 1000.0 / (now - lastStatsTime);
+            uint32_t decodedNow = m_decodedFrameCount.load();
+            m_decodedFps = static_cast<float>(
+                (decodedNow - lastDecodedCount) * 1000.0 / (now - lastStatsTime));
+            lastDecodedCount = decodedNow;
+            LOG_INFO("[Render] render=%.1f fps  video=%.1f fps  frames=%u",
+                     renderFps, m_decodedFps, frameCount);
+            frameCount = 0;
+            lastStatsTime = now;
+        }
+    }
+    LOG_INFO("[Render] Thread stopped");
+}
+
 void ViewerSession::NetworkReceiveThread() {
     LOG_INFO("[NetRecv] Thread started");
     uint32_t totalPackets = 0, videoPackets = 0;
@@ -307,6 +360,7 @@ void ViewerSession::VideoDecodeThread() {
             m_latestFrame.width = width;
             m_latestFrame.height = height;
             frames++;
+            m_decodedFrameCount++;
             if (frames == 1) {
                 LOG_INFO("[VideoDecode] First frame decoded: %ux%u (key=%d input=%zu bytes)",
                          width, height, vp->isKeyFrame, vp->data.size());

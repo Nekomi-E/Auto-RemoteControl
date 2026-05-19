@@ -436,6 +436,8 @@ void D3d11Renderer::RenderFrame(const uint8_t* rgbaData, uint32_t width, uint32_
 
 void D3d11Renderer::Present() {
     if (m_swapChain) {
-        m_swapChain->Present(1, 0);
+        // SyncInterval 0 avoids blocking during DWM operations (window drag, resize).
+        // Frame pacing is handled by the render thread's sleep timer.
+        m_swapChain->Present(0, 0);
     }
 }

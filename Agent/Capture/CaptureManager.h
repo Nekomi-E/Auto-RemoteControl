@@ -43,6 +43,7 @@ public:
 
     // Access to shared D3D11 device for encoder interop
     ID3D11Device* GetD3DDevice() const;
+    ID3D11DeviceContext* GetD3DContext() const;
 
 private:
     struct Impl;

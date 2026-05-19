@@ -1,5 +1,6 @@
 #include "MfVideoEncoder.h"
 #include "Common/Utils/Logger.h"
+#include "Common/Utils/WorkerThreadPool.h"
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -9,7 +10,6 @@
 #include <wmcodecdsp.h>
 #include <cstring>
 #include <algorithm>
-#include <future>
 #include <thread>
 #include <d3d11.h>
 #include <d3d11_1.h>
@@ -899,23 +899,24 @@ static void BgraToNv12Parallel(const uint8_t* bgra, uint32_t width, uint32_t hei
 
     unsigned int nThreads = std::thread::hardware_concurrency();
     if (nThreads < 2 || height < 120) {
-        // Single-threaded for small frames or single-core
         BgraToNv12Chunk(bgra, width, height, 0, height, yPlane, uvPlane);
         return;
     }
     if (nThreads > 8) nThreads = 8;
 
-    uint32_t rowsPerThread = ((height / nThreads) + 1) & ~1u; // round up to even
-    std::vector<std::future<void>> futures;
+    // Reusable thread pool — avoids creating/destroying threads each frame
+    static WorkerThreadPool pool(nThreads);
 
+    uint32_t rowsPerThread = ((height / nThreads) + 1) & ~1u;
     for (unsigned int t = 0; t < nThreads; ++t) {
         uint32_t start = t * rowsPerThread;
         if (start >= height) break;
         uint32_t end = (start + rowsPerThread < height) ? start + rowsPerThread : height;
-        futures.push_back(std::async(std::launch::async,
-            BgraToNv12Chunk, bgra, width, height, start, end, yPlane, uvPlane));
+        pool.Enqueue([=] {
+            BgraToNv12Chunk(bgra, width, height, start, end, yPlane, uvPlane);
+        });
     }
-    for (auto& f : futures) f.get();
+    pool.WaitAll();
 }
 
 bool MfVideoEncoder::EncodeFrame(const uint8_t* rawFrame, uint32_t width, uint32_t height,
@@ -1284,20 +1285,35 @@ bool MfVideoEncoder::ProcessInput(const uint8_t* rawFrame, uint32_t width, uint3
         height = m_impl->height;
     }
 
-    // --- Build IMFSample from BGRA input ---
-    // Use CPU BGRA→NV12 conversion with a CPU-backed media buffer.
-    // GPU texture upload is skipped because the current encoder
-    // (HEVCVideoExtensionEncoder) is a software implementation:
-    // uploading to GPU would just cause an internal GPU→CPU readback.
-    IMFSample* sample = nullptr;
-    HRESULT hr;
-    uint32_t nv12Size = width * height * 3 / 2;
+    LONGLONG duration = 10000000LL / m_impl->fps; // 100ns units
+    LONGLONG timestamp = static_cast<LONGLONG>(m_impl->frameIndex) * duration;
 
-    // CPU BGRA→NV12 conversion (parallelized across cores)
+    IMFSample* sample = nullptr;
+    HRESULT hr = S_OK;
+
+    // --- Try GPU video processor path first ---
+    // Uses D3D11 VideoProcessor for hardware BGRA→NV12 conversion, producing a
+    // GPU-backed IMFSample that hardware encoders can consume directly without
+    // a CPU round-trip. This eliminates the ~33M CPU integer ops per frame.
+    if (m_impl->d3dDevice && m_impl->d3dContext) {
+        if (ConvertBgraToNv12Gpu(m_impl.get(), frameData, width, height, &sample)) {
+            sample->SetSampleTime(timestamp);
+            sample->SetSampleDuration(duration);
+            hr = m_impl->mft->ProcessInput(0, sample, 0);
+            sample->Release();
+            if (hr == MF_E_NOTACCEPTING)
+                return true; // encoder not ready, will retry next frame
+            if (SUCCEEDED(hr))
+                return true;
+            // GPU path failed at ProcessInput — fall through to CPU path
+        }
+    }
+
+    // --- CPU fallback: BGRA→NV12 conversion with CPU-backed media buffer ---
+    uint32_t nv12Size = width * height * 3 / 2;
     m_impl->nv12Buffer.resize(nv12Size);
     BgraToNv12Parallel(frameData, width, height, m_impl->nv12Buffer);
 
-    // CPU memory buffer — avoids GPU upload/download round-trip
     IMFMediaBuffer* mediaBuffer = nullptr;
     hr = MFCreateMemoryBuffer(static_cast<DWORD>(nv12Size), &mediaBuffer);
     if (FAILED(hr)) return false;
@@ -1320,9 +1336,6 @@ bool MfVideoEncoder::ProcessInput(const uint8_t* rawFrame, uint32_t width, uint3
     sample->AddBuffer(mediaBuffer);
     mediaBuffer->Release();
 
-    // Set timestamp
-    LONGLONG duration = 10000000LL / m_impl->fps; // 100ns units
-    LONGLONG timestamp = static_cast<LONGLONG>(m_impl->frameIndex) * duration;
     sample->SetSampleTime(timestamp);
     sample->SetSampleDuration(duration);
 
