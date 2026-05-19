@@ -36,14 +36,27 @@ bool ViewerWindow::Create(HINSTANCE hInstance, uint32_t width, uint32_t height, 
         return false;
     }
 
-    // Calculate window size (accounting for window decorations)
-    RECT rect = { 0, 0, (LONG)width, (LONG)height };
+    // Calculate window size to fit within work area
+    RECT workArea;
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &workArea, 0);
+    uint32_t availW = workArea.right - workArea.left;
+    uint32_t availH = workArea.bottom - workArea.top;
+
+    uint32_t clientW = width;
+    uint32_t clientH = height;
+    // Scale down if remote is larger than available space (leave 5% margin)
+    if (clientW > availW || clientH > availH) {
+        float scale = (float)availW / clientW;
+        if ((float)availH / clientH < scale) scale = (float)availH / clientH;
+        clientW = (uint32_t)(clientW * scale * 0.95f);
+        clientH = (uint32_t)(clientH * scale * 0.95f);
+    }
+
     DWORD style = WS_OVERLAPPEDWINDOW;
+    RECT rect = { 0, 0, (LONG)clientW, (LONG)clientH };
     if (fullscreen) {
         style = WS_POPUP;
-        width = GetSystemMetrics(SM_CXSCREEN);
-        height = GetSystemMetrics(SM_CYSCREEN);
-        rect = { 0, 0, (LONG)width, (LONG)height };
+        rect = { 0, 0, (LONG)availW, (LONG)availH };
     }
     AdjustWindowRect(&rect, style, FALSE);
 

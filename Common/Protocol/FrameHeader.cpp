@@ -42,4 +42,9 @@ void FrameHeader::setRetransmit(bool v) {
     else   flags &= ~FLAG_RETRANSMIT;
 }
 
+void FrameHeader::setFragment(bool v) {
+    if (v) flags |= FLAG_FRAGMENT;
+    else   flags &= ~FLAG_FRAGMENT;
+}
+
 } // namespace Protocol

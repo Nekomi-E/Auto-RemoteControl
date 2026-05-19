@@ -1,6 +1,7 @@
 #include "Logger.h"
 #include <cstdarg>
 #include <ctime>
+#include <windows.h>
 
 Logger& Logger::Instance() {
     static Logger logger;
@@ -85,6 +86,9 @@ void Logger::Write(LogLevel level, const char* file, int line, const std::string
     char out[4608];
     int n = snprintf(out, sizeof(out), "[%s] [%s] %s:%d %s\n",
                      timeBuf, levelStr[static_cast<int>(level)], filename, line, msg.c_str());
+
+    // Output to VS debugger (visible in Output window even for GUI apps)
+    OutputDebugStringA(out);
 
     std::lock_guard lock(m_mutex);
     fwrite(out, 1, n > 0 ? n : sizeof(out) - 1, stdout);

@@ -8,6 +8,7 @@
 #include "Input/RawInputCapture.h"
 #include "Common/Utils/Logger.h"
 #include "Common/Utils/Timer.h"
+#include "Common/Utils/DebugScreenshot.h"
 
 ViewerSession::ViewerSession() {}
 
@@ -62,7 +63,7 @@ bool ViewerSession::Initialize(const ViewerConfig& config) {
     return true;
 }
 
-void ViewerSession::SetRenderWindow(HWND hwnd) {
+bool ViewerSession::SetRenderWindow(HWND hwnd) {
     m_hwnd = hwnd;
     RECT rect;
     GetClientRect(hwnd, &rect);
@@ -70,8 +71,12 @@ void ViewerSession::SetRenderWindow(HWND hwnd) {
     m_windowHeight = rect.bottom - rect.top;
 
     // Initialize D3D11 renderer with the window
-    m_renderer->Initialize(hwnd, m_remoteWidth, m_remoteHeight);
+    if (!m_renderer->Initialize(hwnd, m_remoteWidth, m_remoteHeight)) {
+        LOG_ERROR("Failed to initialize D3D11 renderer");
+        return false;
+    }
     m_overlay->Initialize(hwnd, m_renderer->GetD2DDeviceContext());
+    return true;
 }
 
 void ViewerSession::Start() {
@@ -229,13 +234,25 @@ void ViewerSession::OnRawInput(HRAWINPUT hRawInput) {
 
 void ViewerSession::NetworkReceiveThread() {
     LOG_INFO("[NetRecv] Thread started");
+    uint32_t totalPackets = 0, videoPackets = 0;
+    int64_t lastStatsTime = Timer::NowMs();
+    uint32_t debugSaveCount = 0;
 
     while (m_running) {
         // Receive data frame
         ViewerNetworkImpl::DataPacket packet;
         if (m_network->ReceiveDataFrame(packet, 10)) {
+            totalPackets++;
             if (packet.type == Protocol::FrameType::VIDEO_KEYFRAME ||
                 packet.type == Protocol::FrameType::VIDEO_DELTA) {
+                videoPackets++;
+
+                // DEBUG: Save first 5 received H.264 bitstreams
+                if (debugSaveCount < 5 && !packet.data.empty()) {
+                    SaveRawData("viewer_received", packet.data.data(), packet.data.size());
+                    debugSaveCount++;
+                }
+
                 VideoPacket vp;
                 vp.data = std::move(packet.data);
                 vp.isKeyFrame = (packet.type == Protocol::FrameType::VIDEO_KEYFRAME);
@@ -249,6 +266,14 @@ void ViewerSession::NetworkReceiveThread() {
             }
         }
 
+        // Periodic stats
+        auto now = Timer::NowMs();
+        if (now - lastStatsTime >= 5000) {
+            LOG_INFO("[NetRecv] Packets: total=%u video=%u queue=%zu",
+                     totalPackets, videoPackets, m_videoQueue.size());
+            lastStatsTime = now;
+        }
+
         // Check for incoming control messages
         auto ctrlMsg = m_network->ReceiveControlMessage(1);
         if (ctrlMsg && ctrlMsg->type == Protocol::MessageType::SESSION_STOP) {
@@ -256,12 +281,14 @@ void ViewerSession::NetworkReceiveThread() {
             m_running = false;
         }
     }
-    LOG_INFO("[NetRecv] Thread stopped");
+    LOG_INFO("[NetRecv] Thread stopped, total=%u video=%u", totalPackets, videoPackets);
 }
 
 void ViewerSession::VideoDecodeThread() {
     LOG_INFO("[VideoDecode] Thread started");
-    uint32_t frames = 0;
+    uint32_t frames = 0, fails = 0;
+    int64_t lastDebugSaveMs = 0;
+    uint32_t debugSaveCount = 0;
 
     while (m_running) {
         auto vp = m_videoQueue.tryPop(50);
@@ -276,9 +303,24 @@ void ViewerSession::VideoDecodeThread() {
             m_latestFrame.width = width;
             m_latestFrame.height = height;
             frames++;
+            if (frames == 1) {
+                LOG_INFO("[VideoDecode] First frame decoded: %ux%u (key=%d input=%zu bytes)",
+                         width, height, vp->isKeyFrame, vp->data.size());
+            }
+
+            // DEBUG: Save decoded RGBA frame to BMP every ~5 seconds (up to 10)
+            auto now = Timer::NowMs();
+            if (debugSaveCount < 10 && (debugSaveCount == 0 || now - lastDebugSaveMs >= 5000)) {
+                SaveBmp("viewer_decoded", m_latestFrame.data.data(),
+                        m_latestFrame.width, m_latestFrame.height, false);
+                lastDebugSaveMs = now;
+                debugSaveCount++;
+            }
+        } else {
+            fails++;
         }
     }
-    LOG_INFO("[VideoDecode] Thread stopped, %u frames decoded", frames);
+    LOG_INFO("[VideoDecode] Thread stopped, %u frames decoded, %u fails", frames, fails);
 }
 
 void ViewerSession::AudioDecodeThread() {

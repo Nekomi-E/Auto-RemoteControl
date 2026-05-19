@@ -41,12 +41,22 @@ bool ViewerNetworkImpl::Connect(const std::string& host, uint16_t port,
     int nodelay = 1;
     setsockopt(m_tcpSocket, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
 
-    if (connect(m_tcpSocket, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
-        LOG_ERROR("TCP connect failed: %d", WSAGetLastError());
-        freeaddrinfo(result);
-        closesocket(m_tcpSocket);
-        m_tcpSocket = INVALID_SOCKET;
-        return false;
+    // Retry connect up to 5 times (Agent may still be initializing)
+    int retries = 5;
+    while (retries-- > 0) {
+        if (connect(m_tcpSocket, result->ai_addr, (int)result->ai_addrlen) != SOCKET_ERROR) {
+            break; // Success
+        }
+        int err = WSAGetLastError();
+        LOG_WARNING("TCP connect attempt %d failed: %d, retrying in 2s...", 5 - retries, err);
+        if (retries == 0) {
+            LOG_ERROR("TCP connect failed after all retries: %d", err);
+            freeaddrinfo(result);
+            closesocket(m_tcpSocket);
+            m_tcpSocket = INVALID_SOCKET;
+            return false;
+        }
+        Sleep(2000);
     }
     freeaddrinfo(result);
 
@@ -99,10 +109,17 @@ void ViewerNetworkImpl::Disconnect() {
 bool ViewerNetworkImpl::PerformHandshake() {
     Authenticator auth(Authenticator::Role::Viewer, m_password);
 
+    // Set receive timeout (15s for handshake)
+    DWORD rcvTimeout = 15000;
+    setsockopt(m_tcpSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTimeout, sizeof(rcvTimeout));
+
     // Step 1: Receive authentication challenge
     uint8_t lenBuf[4];
     int received = recv(m_tcpSocket, (char*)lenBuf, 4, MSG_WAITALL);
-    if (received != 4) return false;
+    if (received != 4) {
+        LOG_ERROR("recv AUTH_REQUEST failed: received=%d err=%d", received, WSAGetLastError());
+        return false;
+    }
 
     uint32_t msgLen = (static_cast<uint32_t>(lenBuf[0]) << 24)
                     | (static_cast<uint32_t>(lenBuf[1]) << 16)
@@ -137,19 +154,28 @@ bool ViewerNetworkImpl::PerformHandshake() {
     if (m_enableEncryption) {
         // Receive Agent's public key
         received = recv(m_tcpSocket, (char*)lenBuf, 4, MSG_WAITALL);
-        if (received != 4) return false;
+        if (received != 4) {
+            LOG_ERROR("recv KEY_EXCHANGE len failed: received=%d err=%d", received, WSAGetLastError());
+            return false;
+        }
 
         msgLen = (static_cast<uint32_t>(lenBuf[0]) << 24)
                | (static_cast<uint32_t>(lenBuf[1]) << 16)
                | (static_cast<uint32_t>(lenBuf[2]) << 8)
                | lenBuf[3];
+        if (msgLen > 1024 * 1024) return false;
         msgBuf.resize(msgLen);
         received = recv(m_tcpSocket, (char*)msgBuf.data(), msgLen, MSG_WAITALL);
-        if (received != static_cast<int>(msgLen)) return false;
+        if (received != static_cast<int>(msgLen)) {
+            LOG_ERROR("recv KEY_EXCHANGE body failed: received=%d err=%d", received, WSAGetLastError());
+            return false;
+        }
 
         auto keyMsg = Protocol::ControlMessage::deserialize(msgBuf.data(), msgBuf.size());
         if (!keyMsg || keyMsg->type != Protocol::MessageType::KEY_EXCHANGE || !keyMsg->publicKey) {
-            LOG_ERROR("Expected KEY_EXCHANGE");
+            LOG_ERROR("Invalid KEY_EXCHANGE: type=%d hasKey=%d",
+                      keyMsg ? (int)keyMsg->type : -1,
+                      keyMsg && keyMsg->publicKey ? 1 : 0);
             return false;
         }
 
@@ -157,25 +183,47 @@ bool ViewerNetworkImpl::PerformHandshake() {
 
         // Generate our key pair and compute shared secret
         DiffieHellman dh;
-        if (!dh.GenerateKeyPair()) return false;
+        if (!dh.GenerateKeyPair()) {
+            LOG_ERROR("DH GenerateKeyPair failed");
+            return false;
+        }
 
         auto ourPubKey = dh.GetPublicKey();
         auto sharedSecret = dh.ComputeSharedSecret(agentPubKey);
-        if (sharedSecret.empty()) return false;
+        if (sharedSecret.empty()) {
+            LOG_ERROR("DH ComputeSharedSecret failed");
+            return false;
+        }
 
         auto aesKey = dh.GetAesKey(sharedSecret);
 
-        // Send our public key
+        // Get our UDP port (assigned by bind to port 0)
+        sockaddr_in udpBoundAddr = {};
+        int addrLen = sizeof(udpBoundAddr);
+        getsockname(m_udpSocket, (sockaddr*)&udpBoundAddr, &addrLen);
+        uint16_t udpPort = ntohs(udpBoundAddr.sin_port);
+        LOG_INFO("UDP port bound: %u", udpPort);
+
+        // Send our public key + UDP port
         Protocol::ControlMessage ourKeyMsg;
         ourKeyMsg.type = Protocol::MessageType::KEY_EXCHANGE;
         ourKeyMsg.publicKey = Authenticator::BytesToHex(ourPubKey);
+        ourKeyMsg.udpPort = udpPort;
 
         wireData = ourKeyMsg.serialize();
-        send(m_tcpSocket, (const char*)wireData.data(), (int)wireData.size(), 0);
+        int sent = send(m_tcpSocket, (const char*)wireData.data(), (int)wireData.size(), 0);
+        if (sent != static_cast<int>(wireData.size())) {
+            LOG_ERROR("send KEY_EXCHANGE response failed: sent=%d expected=%zu err=%d",
+                      sent, wireData.size(), WSAGetLastError());
+            return false;
+        }
 
         // Initialize secure channel
         m_secureChannel = std::make_unique<SecureChannel>();
-        if (!m_secureChannel->Initialize(aesKey)) return false;
+        if (!m_secureChannel->Initialize(aesKey)) {
+            LOG_ERROR("SecureChannel init failed");
+            return false;
+        }
 
         m_encrypted = true;
         LOG_INFO("Secure channel established");
@@ -198,7 +246,10 @@ bool ViewerNetworkImpl::PerformHandshake() {
         return false;
     }
 
-    LOG_INFO("Session handshake complete");
+    if (startMsg->screenWidth)  m_remoteWidth  = *startMsg->screenWidth;
+    if (startMsg->screenHeight) m_remoteHeight = *startMsg->screenHeight;
+    LOG_INFO("Session handshake complete, remote screen: %ux%u",
+             m_remoteWidth, m_remoteHeight);
     return true;
 }
 
@@ -267,11 +318,69 @@ bool ViewerNetworkImpl::ReceiveDataFrame(DataPacket& outPacket, int timeoutMs) {
     std::vector<uint8_t> plaintext;
     if (header->isEncrypted() && m_secureChannel && m_secureChannel->IsReady()) {
         if (!m_secureChannel->DecryptFrame(payload, payloadSize, *header, plaintext)) {
-            // Auth failure or corrupted packet
             return false;
         }
         payload = plaintext.data();
         payloadSize = plaintext.size();
+    }
+
+    // Handle fragmented packet
+    if (header->isFragment()) {
+        if (payloadSize < Protocol::FragmentHeader::WireSize) return false;
+
+        Protocol::FragmentHeader fragHdr;
+        fragHdr.fragmentId = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
+        fragHdr.fragmentIndex = (static_cast<uint16_t>(payload[2]) << 8) | payload[3];
+        fragHdr.totalFragments = (static_cast<uint16_t>(payload[4]) << 8) | payload[5];
+
+        const uint8_t* chunkData = payload + Protocol::FragmentHeader::WireSize;
+        size_t chunkSize = payloadSize - Protocol::FragmentHeader::WireSize;
+
+        auto& buf = m_fragments[fragHdr.fragmentId];
+        if (buf.totalFrags == 0) {
+            buf.totalFrags = fragHdr.totalFragments;
+            buf.chunks.resize(fragHdr.totalFragments);
+            buf.firstSeen = Timer::NowMs();
+        }
+
+        if (fragHdr.fragmentIndex < buf.totalFrags && buf.chunks[fragHdr.fragmentIndex].empty()) {
+            buf.chunks[fragHdr.fragmentIndex].assign(chunkData, chunkData + chunkSize);
+            buf.receivedMask |= (1u << fragHdr.fragmentIndex);
+            buf.totalSize += static_cast<uint32_t>(chunkSize);
+        }
+
+        // Check if all fragments received
+        uint16_t allMask = (buf.totalFrags < 16) ? ((1u << buf.totalFrags) - 1) : 0xFFFF;
+        if (buf.receivedMask == allMask) {
+            // Reassemble
+            std::vector<uint8_t> reassembled;
+            reassembled.reserve(buf.totalSize);
+            for (uint16_t i = 0; i < buf.totalFrags; i++) {
+                reassembled.insert(reassembled.end(),
+                                   buf.chunks[i].begin(), buf.chunks[i].end());
+            }
+            m_fragments.erase(fragHdr.fragmentId);
+
+            outPacket.type = static_cast<Protocol::FrameType>(header->type);
+            outPacket.timestampMs = header->timestampMs;
+            outPacket.data = std::move(reassembled);
+            return true;
+        }
+        return false; // Waiting for more fragments
+    }
+
+    // Clean up stale fragments periodically
+    auto fragNow = Timer::NowMs();
+    if (fragNow - m_lastFragCleanup > 5000) {
+        m_lastFragCleanup = fragNow;
+        auto it = m_fragments.begin();
+        while (it != m_fragments.end()) {
+            if (fragNow - it->second.firstSeen > 30000) {
+                it = m_fragments.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     outPacket.type = static_cast<Protocol::FrameType>(header->type);

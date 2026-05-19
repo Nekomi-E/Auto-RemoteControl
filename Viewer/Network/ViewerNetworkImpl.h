@@ -9,6 +9,8 @@
 #include <memory>
 #include <optional>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
 
 class ViewerNetworkImpl {
 public:
@@ -53,4 +55,15 @@ private:
     uint32_t m_remoteWidth = 1920;
     uint32_t m_remoteHeight = 1080;
     float m_fps = 0;
+
+    // Fragment reassembly
+    struct FragBuf {
+        uint16_t totalFrags = 0;
+        uint16_t receivedMask = 0;  // bitmask for up to 16 fragments
+        std::vector<std::vector<uint8_t>> chunks;
+        int64_t firstSeen = 0;
+        uint32_t totalSize = 0;
+    };
+    std::unordered_map<uint16_t, FragBuf> m_fragments;
+    int64_t m_lastFragCleanup = 0;
 };

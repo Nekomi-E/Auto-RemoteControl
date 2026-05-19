@@ -2,6 +2,7 @@
 #include "Common/Common.h"
 #include "Common/Utils/Logger.h"
 #include "Common/Utils/Timer.h"
+#include "Common/Utils/DebugScreenshot.h"
 
 AgentSession::AgentSession() {}
 
@@ -72,6 +73,14 @@ bool AgentSession::Initialize(const AgentConfig& config) {
         return false;
     }
 
+    // Notify network of actual encoder resolution (may differ from monitor due to HW limits)
+    uint32_t actualEncWidth = m_encoderMgr->GetEncoderWidth();
+    uint32_t actualEncHeight = m_encoderMgr->GetEncoderHeight();
+    m_network->SetScreenInfo(actualEncWidth, actualEncHeight);
+
+    LOG_INFO("  Encoder resolution: %ux%u (monitor: %ux%u)",
+             actualEncWidth, actualEncHeight, encWidth, encHeight);
+
     LOG_INFO("Agent initialized successfully");
     LOG_INFO("  Monitor: %ux%u, Bitrate: %u bps, FPS: %u",
              encWidth, encHeight, m_config.videoBitrate, m_config.targetFps);
@@ -120,7 +129,7 @@ void AgentSession::Stop() {
 }
 
 void AgentSession::AcceptThread() {
-    LOG_INFO("[Accept] Thread started");
+    LOG_INFO("[Accept] Thread started, listening on port %u", m_config.port);
     while (m_running) {
         if (m_network->AcceptConnection(1000)) {
             m_clientConnected = true;
@@ -156,7 +165,9 @@ void AgentSession::AcceptThread() {
 
 void AgentSession::CaptureThread() {
     LOG_INFO("[Capture] Thread started");
-    uint32_t frameCount = 0;
+    uint32_t frameCount = 0, failCount = 0;
+    int64_t lastDebugSaveMs = 0;
+    uint32_t debugSaveCount = 0;
 
     while (m_running) {
         if (!m_clientConnected) {
@@ -169,27 +180,58 @@ void AgentSession::CaptureThread() {
         if (m_captureMgr->AcquireFrame(frameData, width, height)) {
             m_encoderMgr->SubmitVideoFrame(frameData, width, height, Timer::NowMs());
             frameCount++;
+            if (frameCount == 1) {
+                LOG_INFO("[Capture] First frame captured: %ux%u", width, height);
+            }
+
+            // DEBUG: Save raw capture to BMP every ~5 seconds (up to 10)
+            auto now = Timer::NowMs();
+            if (debugSaveCount < 10 && (debugSaveCount == 0 || now - lastDebugSaveMs >= 5000)) {
+                SaveBmp("agent_capture", frameData.data(), width, height, true);
+                lastDebugSaveMs = now;
+                debugSaveCount++;
+            }
+        } else {
+            failCount++;
         }
     }
-    LOG_INFO("[Capture] Thread stopped, %u frames captured", frameCount);
+    LOG_INFO("[Capture] Thread stopped, %u frames captured, %u fails", frameCount, failCount);
 }
 
 void AgentSession::VideoEncodeThread() {
     LOG_INFO("[VideoEncode] Thread started");
+    uint32_t frameCount = 0;
+    uint32_t debugSaveCount = 0;
 
     while (m_running) {
         EncoderManager::EncodedFrame encFrame;
         if (m_encoderMgr->GetEncodedVideoFrame(encFrame, 50)) {
+            size_t encSize = encFrame.data.size();
+            auto encWidth = encFrame.width;
+            auto encHeight = encFrame.height;
+            auto encKey = encFrame.isKeyFrame;
+
+            // DEBUG: Save first 5 encoded H.264 bitstreams (before move)
+            if (debugSaveCount < 5 && encSize > 0) {
+                SaveRawData("agent_encoded", encFrame.data.data(), encSize);
+                debugSaveCount++;
+            }
+
             VideoFrame vf;
             vf.data = std::move(encFrame.data);
-            vf.isKeyFrame = encFrame.isKeyFrame;
-            vf.width = encFrame.width;
-            vf.height = encFrame.height;
+            vf.isKeyFrame = encKey;
+            vf.width = encWidth;
+            vf.height = encHeight;
             vf.timestampMs = encFrame.timestampMs;
             m_videoSendQueue.tryPush(std::move(vf));
+            frameCount++;
+            if (frameCount == 1) {
+                LOG_INFO("[VideoEncode] First encoded frame: %ux%u key=%d size=%zu",
+                         encWidth, encHeight, encKey, encSize);
+            }
         }
     }
-    LOG_INFO("[VideoEncode] Thread stopped");
+    LOG_INFO("[VideoEncode] Thread stopped, %u frames", frameCount);
 }
 
 void AgentSession::AudioCaptureThread() {
@@ -226,7 +268,8 @@ void AgentSession::AudioEncodeThread() {
 
 void AgentSession::NetworkSendThread() {
     LOG_INFO("[NetworkSend] Thread started");
-    uint32_t videoSent = 0, audioSent = 0;
+    uint32_t videoSent = 0, audioSent = 0, videoFail = 0;
+    int64_t lastStatsTime = Timer::NowMs();
 
     while (m_running) {
         // Send video frames (higher priority)
@@ -239,6 +282,16 @@ void AgentSession::NetworkSendThread() {
             if (m_network->SendDataFrame(type, seq, vf->timestampMs,
                                          vf->data.data(), vf->data.size())) {
                 videoSent++;
+                if (videoSent == 1) {
+                    LOG_INFO("[NetworkSend] First frame sent: key=%d size=%zu",
+                             vf->isKeyFrame, vf->data.size());
+                }
+            } else {
+                videoFail++;
+                if (videoFail <= 3) {
+                    LOG_WARNING("[NetworkSend] Send failed: key=%d size=%zu seq=%u",
+                                vf->isKeyFrame, vf->data.size(), seq);
+                }
             }
         }
 
@@ -252,8 +305,16 @@ void AgentSession::NetworkSendThread() {
                 audioSent++;
             }
         }
+
+        // Periodic stats
+        auto now = Timer::NowMs();
+        if (now - lastStatsTime >= 5000) {
+            LOG_INFO("[NetworkSend] Sent: video=%u (fail=%u) audio=%u queue=%zu",
+                     videoSent, videoFail, audioSent, m_videoSendQueue.size());
+            lastStatsTime = now;
+        }
     }
-    LOG_INFO("[NetworkSend] Thread stopped, video=%u audio=%u", videoSent, audioSent);
+    LOG_INFO("[NetworkSend] Thread stopped, video=%u audio=%u fail=%u", videoSent, audioSent, videoFail);
 }
 
 void AgentSession::InputInjectThread() {

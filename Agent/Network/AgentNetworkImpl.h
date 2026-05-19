@@ -22,6 +22,12 @@ public:
     bool AcceptConnection(int timeoutMs);
     bool IsConnected() const { return m_connected; }
 
+    // Screen info for SESSION_START
+    void SetScreenInfo(uint32_t width, uint32_t height) {
+        m_screenWidth = width;
+        m_screenHeight = height;
+    }
+
     // Control messages (TCP)
     bool SendControlMessage(const Protocol::ControlMessage& msg);
     std::optional<Protocol::ControlMessage> ReceiveControlMessage(int timeoutMs);
@@ -49,4 +55,7 @@ private:
     std::atomic<bool> m_connected{false};
     std::atomic<bool> m_encrypted{false};
     std::mutex m_sendMutex; // TCP send serialization
+
+    std::atomic<uint32_t> m_screenWidth{1920};
+    std::atomic<uint32_t> m_screenHeight{1080};
 };

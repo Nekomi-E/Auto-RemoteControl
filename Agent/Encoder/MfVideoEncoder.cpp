@@ -26,6 +26,10 @@ struct MfVideoEncoder::Impl {
 
     bool initialized = false;
     bool needKeyFrame = true;
+
+    // Codec data (SPS/PPS) read from output type after configuration
+    // Prepend to first frame after each keyframe request
+    std::vector<uint8_t> codecData;
 };
 
 MfVideoEncoder::MfVideoEncoder() : m_impl(std::make_unique<Impl>()) {}
@@ -63,7 +67,10 @@ bool MfVideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
 
 void MfVideoEncoder::Shutdown() {
     m_impl->initialized = false;
-    if (m_impl->mft) m_impl->mft->Release();
+    if (m_impl->mft) {
+        m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        m_impl->mft->Release();
+    }
     if (m_impl->inputType) m_impl->inputType->Release();
     if (m_impl->outputType) m_impl->outputType->Release();
     m_impl->mft = nullptr;
@@ -265,6 +272,26 @@ bool MfVideoEncoder::ConfigureMediaTypes() {
         attrs->Release();
     }
 
+    // Notify encoder to begin streaming
+    m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+    // Read back codec data (SPS/PPS) from the output type
+    if (m_impl->outputType) {
+        UINT32 blobSize = 0;
+        if (SUCCEEDED(m_impl->outputType->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER,
+                                                   nullptr, 0, &blobSize)) &&
+            blobSize > 0) {
+            m_impl->codecData.resize(blobSize);
+            if (SUCCEEDED(m_impl->outputType->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER,
+                                                       m_impl->codecData.data(),
+                                                       blobSize, &blobSize))) {
+                LOG_INFO("Encoder codec data (SPS/PPS): %u bytes", blobSize);
+            } else {
+                m_impl->codecData.clear();
+            }
+        }
+    }
+
     return true;
 }
 
@@ -310,7 +337,12 @@ bool MfVideoEncoder::EncodeFrame(const uint8_t* rawFrame, uint32_t width, uint32
 
     m_impl->frameIndex++;
 
-    // Force a keyframe periodically
+    // Clear keyframe flag once one is produced
+    if (outIsKeyFrame) {
+        m_impl->needKeyFrame = false;
+    }
+
+    // Force a keyframe periodically or on request
     if (m_impl->needKeyFrame || (m_impl->frameIndex % 120 == 0)) {
         RequestKeyFrame();
     }
@@ -408,7 +440,6 @@ bool MfVideoEncoder::ProcessOutput(std::vector<uint8_t>& outBitstream, bool& out
             hr = MFCreateSample(&sample);
             if (SUCCEEDED(hr)) {
                 sample->AddBuffer(buf);
-                buf->Release();
             }
         }
         if (buf) buf->Release();
@@ -437,8 +468,6 @@ bool MfVideoEncoder::ProcessOutput(std::vector<uint8_t>& outBitstream, bool& out
         DWORD totalLength = 0;
         hr = outputBuffer.pSample->GetTotalLength(&totalLength);
         if (SUCCEEDED(hr) && totalLength > 0) {
-            outBitstream.resize(totalLength);
-
             IMFMediaBuffer* buf = nullptr;
             hr = outputBuffer.pSample->ConvertToContiguousBuffer(&buf);
             if (SUCCEEDED(hr)) {
@@ -446,7 +475,60 @@ bool MfVideoEncoder::ProcessOutput(std::vector<uint8_t>& outBitstream, bool& out
                 DWORD maxLen = 0, curLen = 0;
                 hr = buf->Lock(&data, &maxLen, &curLen);
                 if (SUCCEEDED(hr)) {
-                    memcpy(outBitstream.data(), data, curLen);
+                    // Check if bitstream contains SPS (NAL type 7 = 0x67 after start code)
+                    bool hasSPS = false;
+                    if (curLen >= 5) {
+                        // Look for Annex B start code + SPS NAL header (0x67)
+                        for (DWORD i = 0; i + 4 < curLen; ++i) {
+                            if (data[i] == 0x00 && data[i+1] == 0x00) {
+                                if (data[i+2] == 0x00 && data[i+3] == 0x01) {
+                                    // 4-byte start code found
+                                    BYTE nalType = data[i+4] & 0x1F;
+                                    if (nalType == 7) { hasSPS = true; break; }
+                                    i += 4;
+                                } else if (data[i+2] == 0x01) {
+                                    // 3-byte start code found
+                                    BYTE nalType = data[i+3] & 0x1F;
+                                    if (nalType == 7) { hasSPS = true; break; }
+                                    i += 3;
+                                }
+                            }
+                        }
+                    }
+
+                    // Try to get codec data from output type if we don't have it yet
+                    if (m_impl->codecData.empty()) {
+                        IMFMediaType* outType = nullptr;
+                        if (SUCCEEDED(m_impl->mft->GetOutputCurrentType(0, &outType))) {
+                            UINT32 blobSize = 0;
+                            if (SUCCEEDED(outType->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER,
+                                                           nullptr, 0, &blobSize)) &&
+                                blobSize > 0) {
+                                m_impl->codecData.resize(blobSize);
+                                if (SUCCEEDED(outType->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER,
+                                                               m_impl->codecData.data(),
+                                                               blobSize, &blobSize))) {
+                                    LOG_INFO("Encoder codec data (SPS/PPS): %u bytes", blobSize);
+                                } else {
+                                    m_impl->codecData.clear();
+                                }
+                            }
+                            outType->Release();
+                        }
+                    }
+
+                    // Prepend codec data if keyframe and bitstream lacks SPS
+                    bool missingSPS = outIsKeyFrame && !hasSPS && !m_impl->codecData.empty();
+                    size_t prefix = missingSPS ? m_impl->codecData.size() : 0;
+                    outBitstream.resize(prefix + curLen);
+
+                    if (missingSPS) {
+                        memcpy(outBitstream.data(), m_impl->codecData.data(), prefix);
+                        LOG_INFO("Prepending %zu bytes of SPS/PPS codec data (bitstream missing SPS)",
+                                 prefix);
+                    }
+
+                    memcpy(outBitstream.data() + prefix, data, curLen);
                     buf->Unlock();
                 }
                 buf->Release();
@@ -460,6 +542,9 @@ bool MfVideoEncoder::ProcessOutput(std::vector<uint8_t>& outBitstream, bool& out
     return !outBitstream.empty();
 }
 
+uint32_t MfVideoEncoder::GetWidth() const  { return m_impl->width; }
+uint32_t MfVideoEncoder::GetHeight() const { return m_impl->height; }
+
 void MfVideoEncoder::SetBitrate(uint32_t bitrate) {
     m_impl->bitrate = bitrate;
     if (m_impl->outputType) {
@@ -470,13 +555,6 @@ void MfVideoEncoder::SetBitrate(uint32_t bitrate) {
 
 void MfVideoEncoder::RequestKeyFrame() {
     m_impl->needKeyFrame = true;
-    // Send a keyframe request event to the encoder
-    IMFAttributes* attrs = nullptr;
-    if (SUCCEEDED(m_impl->mft->GetAttributes(&attrs)) && attrs) {
-        attrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
-        attrs->Release();
-    }
-    // Some encoders use ProcessMessage for keyframe requests
+    // Flush encoder to force next frame to be a keyframe (IDR)
     m_impl->mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-    m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 }

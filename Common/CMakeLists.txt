@@ -8,6 +8,7 @@ set(COMMON_SOURCES
     Utils/Logger.cpp
     Utils/Config.cpp
     Utils/Timer.cpp
+    Utils/DebugScreenshot.cpp
 )
 
 add_library(CommonLib STATIC ${COMMON_SOURCES})

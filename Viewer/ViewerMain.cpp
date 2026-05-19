@@ -75,7 +75,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_window = &window;
 
     // Set session render target
-    session.SetRenderWindow(window.GetHWND());
+    if (!session.SetRenderWindow(window.GetHWND())) {
+        LOG_ERROR("Failed to set render window");
+        session.Stop();
+        CoUninitialize();
+        return 1;
+    }
 
     // Start session threads
     session.Start();

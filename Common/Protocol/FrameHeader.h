@@ -17,6 +17,15 @@ enum class FrameType : uint8_t {
 enum FrameFlags : uint8_t {
     FLAG_ENCRYPTED   = 0x01,
     FLAG_RETRANSMIT  = 0x02,
+    FLAG_FRAGMENT    = 0x04,
+};
+
+// Fragment header prepended to payload when FLAG_FRAGMENT is set
+struct FragmentHeader {
+    uint16_t fragmentId;       // same for all fragments of one frame
+    uint16_t fragmentIndex;    // 0-based index
+    uint16_t totalFragments;   // total number of fragments
+    static constexpr size_t WireSize = 6;
 };
 
 #pragma pack(push, 1)
@@ -32,10 +41,12 @@ struct FrameHeader {
     std::vector<uint8_t> serialize() const;
     static std::optional<FrameHeader> deserialize(const uint8_t* data, size_t len);
 
-    bool isEncrypted()  const { return flags & FLAG_ENCRYPTED; }
-    bool isRetransmit() const { return flags & FLAG_RETRANSMIT; }
+    bool isEncrypted()  const { return (flags & FLAG_ENCRYPTED) != 0; }
+    bool isRetransmit() const { return (flags & FLAG_RETRANSMIT) != 0; }
+    bool isFragment()   const { return (flags & FLAG_FRAGMENT) != 0; }
     void setEncrypted(bool v);
     void setRetransmit(bool v);
+    void setFragment(bool v);
 };
 #pragma pack(pop)
 

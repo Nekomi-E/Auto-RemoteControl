@@ -208,6 +208,14 @@ void EncoderManager::AdjustBitrate(uint32_t bitrate) {
     }
 }
 
+uint32_t EncoderManager::GetEncoderWidth() const {
+    return m_impl->videoEncoder ? m_impl->videoEncoder->GetWidth() : 1920;
+}
+
+uint32_t EncoderManager::GetEncoderHeight() const {
+    return m_impl->videoEncoder ? m_impl->videoEncoder->GetHeight() : 1080;
+}
+
 void EncoderManager::RequestKeyFrame() {
     if (m_impl->videoEncoder) {
         m_impl->videoEncoder->RequestKeyFrame();

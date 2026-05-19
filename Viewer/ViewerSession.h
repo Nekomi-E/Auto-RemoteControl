@@ -24,7 +24,7 @@ public:
     void OnMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam);
     void OnRawInput(HRAWINPUT hRawInput);
 
-    void SetRenderWindow(HWND hwnd);
+    bool SetRenderWindow(HWND hwnd);
     uint32_t GetRemoteWidth() const { return m_remoteWidth; }
     uint32_t GetRemoteHeight() const { return m_remoteHeight; }
 

@@ -24,6 +24,7 @@ private:
     ID2D1SolidColorBrush* m_greenBrush = nullptr;
     ID2D1SolidColorBrush* m_redBrush = nullptr;
     ID2D1SolidColorBrush* m_whiteBrush = nullptr;
+    ID2D1SolidColorBrush* m_bgBrush = nullptr;
     IDWriteTextFormat* m_textFormat = nullptr;
     HWND m_targetHwnd = nullptr;
     bool m_initialized = false;

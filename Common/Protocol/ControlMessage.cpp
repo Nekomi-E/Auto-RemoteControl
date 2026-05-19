@@ -103,7 +103,10 @@ std::string ControlMessage::toJson() const {
     if (challenge)  ss << ",\"challenge\":\"" << escapeJson(*challenge) << "\"";
     if (response)   ss << ",\"response\":\"" << escapeJson(*response) << "\"";
     if (publicKey)  ss << ",\"publicKey\":\"" << escapeJson(*publicKey) << "\"";
+    if (udpPort)    ss << ",\"udpPort\":" << *udpPort;
     if (errorMessage) ss << ",\"errorMessage\":\"" << escapeJson(*errorMessage) << "\"";
+    if (screenWidth)  ss << ",\"screenWidth\":" << *screenWidth;
+    if (screenHeight) ss << ",\"screenHeight\":" << *screenHeight;
     if (targetBitrate) ss << ",\"targetBitrate\":" << *targetBitrate;
     if (targetFps)  ss << ",\"targetFps\":" << *targetFps;
 
@@ -157,6 +160,10 @@ std::optional<ControlMessage> ControlMessage::fromJson(const std::string& json) 
     msg.errorMessage = json.find("\"errorMessage\"") != std::string::npos
         ? std::make_optional(extractString(json, "errorMessage")) : std::nullopt;
 
+    msg.udpPort = json.find("\"udpPort\"") != std::string::npos
+        ? std::make_optional(static_cast<uint16_t>(extractUint(json, "udpPort").value_or(0))) : std::nullopt;
+    msg.screenWidth = extractUint(json, "screenWidth");
+    msg.screenHeight = extractUint(json, "screenHeight");
     msg.targetBitrate = extractUint(json, "targetBitrate");
     msg.targetFps = extractUint(json, "targetFps");
 

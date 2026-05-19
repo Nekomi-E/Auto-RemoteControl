@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(taskkill /F /IM Agent.exe)",
+      "Bash(taskkill /F /IM Viewer.exe)",
+      "Bash(start \"RemoteControl-Agent\" \"build\\\\Agent\\\\Debug\\\\Agent.exe\" --port 27016 --password \"test123\")"
+    ]
+  }
+}

@@ -70,9 +70,14 @@ public:
 
     // Key exchange
     std::optional<std::string> publicKey; // base64 ECDH P-256 public key
+    std::optional<uint16_t> udpPort;      // Viewer's UDP port for data channel
 
     // Input
     std::vector<InputEvent> inputEvents;
+
+    // Session info
+    std::optional<uint32_t> screenWidth;
+    std::optional<uint32_t> screenHeight;
 
     // Quality
     std::optional<uint32_t> targetBitrate;

@@ -14,6 +14,9 @@ public:
     bool EncodeFrame(const uint8_t* rawFrame, uint32_t width, uint32_t height,
                      std::vector<uint8_t>& outBitstream, bool& outIsKeyFrame);
 
+    uint32_t GetWidth() const;
+    uint32_t GetHeight() const;
+
     void SetBitrate(uint32_t bitrate);
     void RequestKeyFrame();
 

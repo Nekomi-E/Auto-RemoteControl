@@ -39,6 +39,9 @@ public:
     void AdjustBitrate(uint32_t bitrate);
     void RequestKeyFrame();
 
+    uint32_t GetEncoderWidth() const;
+    uint32_t GetEncoderHeight() const;
+
     Stats GetStats() const;
 
 private:

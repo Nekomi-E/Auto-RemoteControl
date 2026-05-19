@@ -44,6 +44,8 @@ void D2dOverlay::CreateBrushes() {
         D2D1::ColorF(1.0f, 0.0f, 0.0f, 0.8f), &m_redBrush);
     m_d2dContext->CreateSolidColorBrush(
         D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.8f), &m_whiteBrush);
+    m_d2dContext->CreateSolidColorBrush(
+        D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.5f), &m_bgBrush);
 }
 
 void D2dOverlay::Shutdown() {
@@ -51,10 +53,12 @@ void D2dOverlay::Shutdown() {
     if (m_greenBrush) m_greenBrush->Release();
     if (m_redBrush) m_redBrush->Release();
     if (m_whiteBrush) m_whiteBrush->Release();
+    if (m_bgBrush) m_bgBrush->Release();
     if (m_textFormat) m_textFormat->Release();
     m_greenBrush = nullptr;
     m_redBrush = nullptr;
     m_whiteBrush = nullptr;
+    m_bgBrush = nullptr;
     m_textFormat = nullptr;
 }
 
@@ -67,12 +71,8 @@ void D2dOverlay::Draw(float fps, bool connected) {
     D2D1_SIZE_F targetSize = m_d2dContext->GetSize();
     D2D1_RECT_F bgRect = D2D1::RectF(0, 0, targetSize.width, 28);
 
-    ID2D1SolidColorBrush* bgBrush = nullptr;
-    m_d2dContext->CreateSolidColorBrush(
-        D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.5f), &bgBrush);
-    if (bgBrush) {
-        m_d2dContext->FillRectangle(bgRect, bgBrush);
-        bgBrush->Release();
+    if (m_bgBrush) {
+        m_d2dContext->FillRectangle(bgRect, m_bgBrush);
     }
 
     // Connection status

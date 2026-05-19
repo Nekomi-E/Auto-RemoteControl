@@ -1,4 +1,5 @@
 #include "DiffieHellman.h"
+#include "Utils/Logger.h"
 #include <windows.h>
 #include <bcrypt.h>
 
@@ -55,12 +56,21 @@ std::vector<uint8_t> DiffieHellman::GetPublicKey() const {
 }
 
 std::vector<uint8_t> DiffieHellman::ComputeSharedSecret(const std::vector<uint8_t>& peerPublicKey) {
-    if (!m_impl->ready || !m_impl->hKey || peerPublicKey.size() < 65) return {};
-    if (peerPublicKey[0] != 0x04) return {}; // Only support uncompressed
+    if (!m_impl->ready || !m_impl->hKey) {
+        LOG_ERROR("DH: not ready (ready=%d hKey=%p)", m_impl->ready, (void*)m_impl->hKey);
+        return {};
+    }
+    if (peerPublicKey.size() < 65) {
+        LOG_ERROR("DH: peerPublicKey too small: %zu bytes (need 65)", peerPublicKey.size());
+        return {};
+    }
+    if (peerPublicKey[0] != 0x04) {
+        LOG_ERROR("DH: unsupported point format: 0x%02X (expected 0x04)", peerPublicKey[0]);
+        return {};
+    }
 
     // Import peer's public key
     BCRYPT_KEY_HANDLE hPeerKey = nullptr;
-    // Build ECC public blob from raw point
     const ULONG blobSize = sizeof(BCRYPT_ECCKEY_BLOB) + 32 + 32;
     std::vector<uint8_t> blob(blobSize, 0);
     BCRYPT_ECCKEY_BLOB* header = reinterpret_cast<BCRYPT_ECCKEY_BLOB*>(blob.data());
@@ -73,22 +83,37 @@ std::vector<uint8_t> DiffieHellman::ComputeSharedSecret(const std::vector<uint8_
 
     NTSTATUS status = BCryptImportKeyPair(m_impl->hAlg, nullptr, BCRYPT_ECCPUBLIC_BLOB,
                                            &hPeerKey, blob.data(), blobSize, 0);
-    if (status != 0) return {};
+    if (status != 0) {
+        LOG_ERROR("DH: BCryptImportKeyPair failed: 0x%08X", status);
+        return {};
+    }
 
     // Compute shared secret
-    ULONG secretSize = 0;
-    BCryptSecretAgreement(m_impl->hKey, hPeerKey, &m_impl->hKey, 0);
-    // We need a different handle for the secret
     BCRYPT_SECRET_HANDLE hSecret = nullptr;
     status = BCryptSecretAgreement(m_impl->hKey, hPeerKey, &hSecret, 0);
     if (status != 0) {
+        LOG_ERROR("DH: BCryptSecretAgreement failed: 0x%08X", status);
         BCryptDestroyKey(hPeerKey);
         return {};
     }
 
-    BCryptDeriveKey(hSecret, BCRYPT_KDF_RAW_SECRET, nullptr, nullptr, 0, &secretSize, 0);
+    ULONG secretSize = 0;
+    status = BCryptDeriveKey(hSecret, BCRYPT_KDF_RAW_SECRET, nullptr, nullptr, 0, &secretSize, 0);
+    if (status != 0) {
+        LOG_ERROR("DH: BCryptDeriveKey (size query) failed: 0x%08X", status);
+        BCryptDestroySecret(hSecret);
+        BCryptDestroyKey(hPeerKey);
+        return {};
+    }
+
     std::vector<uint8_t> secret(secretSize);
     status = BCryptDeriveKey(hSecret, BCRYPT_KDF_RAW_SECRET, nullptr, secret.data(), secretSize, &secretSize, 0);
+    if (status != 0) {
+        LOG_ERROR("DH: BCryptDeriveKey failed: 0x%08X", status);
+        BCryptDestroySecret(hSecret);
+        BCryptDestroyKey(hPeerKey);
+        return {};
+    }
 
     BCryptDestroySecret(hSecret);
     BCryptDestroyKey(hPeerKey);

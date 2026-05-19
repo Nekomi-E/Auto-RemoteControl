@@ -1,6 +1,7 @@
 #include "D3d11Renderer.h"
 #include "Common/Utils/Logger.h"
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <d2d1_1.h>
 #include <d3d11_1.h>
@@ -8,6 +9,48 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "d3dcompiler.lib")
+
+// Fullscreen quad vertex
+struct QuadVertex {
+    float x, y;   // clip-space position
+    float u, v;   // texture coordinates
+};
+
+// Fullscreen triangle: 3 vertices covering clip space (-1..1, -1..1)
+static const QuadVertex g_QuadVertices[] = {
+    {-1.0f,  1.0f, 0.0f, 0.0f},
+    { 3.0f,  1.0f, 2.0f, 0.0f},
+    {-1.0f, -3.0f, 0.0f, 2.0f},
+};
+
+// Vertex shader: pass-through position + texcoord
+static const char g_VsSource[] = R"(
+struct VSInput {
+    float2 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+struct VSOutput {
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+
+VSOutput main(VSInput input) {
+    VSOutput o;
+    o.pos = float4(input.pos, 0.0f, 1.0f);
+    o.uv  = input.uv;
+    return o;
+}
+)";
+
+static const char g_PsSource[] = R"(
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    return tex.Sample(samp, uv);
+}
+)";
 
 D3d11Renderer::D3d11Renderer() {}
 
@@ -18,8 +61,18 @@ bool D3d11Renderer::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
     m_windowWidth = width;
     m_windowHeight = height;
 
-    if (!CreateDeviceResources()) return false;
-    if (!CreateSwapChain(hwnd)) return false;
+    if (!CreateDeviceResources()) {
+        LOG_ERROR("D3D11: CreateDeviceResources failed");
+        return false;
+    }
+    if (!CreateShaders()) {
+        LOG_ERROR("D3D11: CreateShaders failed");
+        return false;
+    }
+    if (!CreateSwapChain(hwnd)) {
+        LOG_ERROR("D3D11: CreateSwapChain failed");
+        return false;
+    }
 
     LOG_INFO("D3D11 renderer initialized: %ux%u", width, height);
     return true;
@@ -60,6 +113,98 @@ bool D3d11Renderer::CreateDeviceResources() {
             d2dFactory->Release();
         }
         dxgiDevice->Release();
+    }
+
+    return true;
+}
+
+bool D3d11Renderer::CreateShaders() {
+    // Compile vertex shader
+    ID3DBlob* vsBlob = nullptr;
+    ID3DBlob* errBlob = nullptr;
+    HRESULT hr = D3DCompile(g_VsSource, strlen(g_VsSource), "vs", nullptr, nullptr,
+                             "main", "vs_4_0", 0, 0, &vsBlob, &errBlob);
+    if (FAILED(hr)) {
+        if (errBlob) {
+            LOG_ERROR("VS compile: %s", (const char*)errBlob->GetBufferPointer());
+            errBlob->Release();
+        }
+        return false;
+    }
+
+    hr = m_device->CreateVertexShader(vsBlob->GetBufferPointer(),
+                                       vsBlob->GetBufferSize(), nullptr, &m_vertexShader);
+    if (FAILED(hr)) {
+        LOG_ERROR("D3D11: CreateVertexShader failed: 0x%08X", hr);
+        vsBlob->Release();
+        return false;
+    }
+
+    // Input layout: position (float2) + texcoord (float2)
+    D3D11_INPUT_ELEMENT_DESC layoutDesc[2] = {};
+    layoutDesc[0].SemanticName = "POSITION";
+    layoutDesc[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+    layoutDesc[0].AlignedByteOffset = 0;
+    layoutDesc[1].SemanticName = "TEXCOORD";
+    layoutDesc[1].Format = DXGI_FORMAT_R32G32_FLOAT;
+    layoutDesc[1].AlignedByteOffset = 8; // after 2 floats
+
+    hr = m_device->CreateInputLayout(layoutDesc, 2,
+                                      vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+                                      &m_inputLayout);
+    vsBlob->Release();
+    if (FAILED(hr)) {
+        LOG_ERROR("D3D11: CreateInputLayout failed: 0x%08X", hr);
+        return false;
+    }
+
+    // Create vertex buffer for fullscreen triangle
+    D3D11_BUFFER_DESC vbDesc = {};
+    vbDesc.ByteWidth = sizeof(g_QuadVertices);
+    vbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+    vbDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+
+    D3D11_SUBRESOURCE_DATA vbData = {};
+    vbData.pSysMem = g_QuadVertices;
+
+    hr = m_device->CreateBuffer(&vbDesc, &vbData, &m_quadVB);
+    if (FAILED(hr)) {
+        LOG_ERROR("D3D11: CreateBuffer(quadVB) failed: 0x%08X", hr);
+        return false;
+    }
+
+    // Compile pixel shader
+    ID3DBlob* psBlob = nullptr;
+    hr = D3DCompile(g_PsSource, strlen(g_PsSource), "ps", nullptr, nullptr,
+                     "main", "ps_4_0", 0, 0, &psBlob, &errBlob);
+    if (FAILED(hr)) {
+        if (errBlob) {
+            LOG_ERROR("D3D11: PS compile: %s", (const char*)errBlob->GetBufferPointer());
+            errBlob->Release();
+        } else {
+            LOG_ERROR("D3D11: PS compile failed: 0x%08X", hr);
+        }
+        return false;
+    }
+
+    hr = m_device->CreatePixelShader(psBlob->GetBufferPointer(),
+                                      psBlob->GetBufferSize(), nullptr, &m_pixelShader);
+    psBlob->Release();
+    if (FAILED(hr)) {
+        LOG_ERROR("D3D11: CreatePixelShader failed: 0x%08X", hr);
+        return false;
+    }
+
+    // Sampler state
+    D3D11_SAMPLER_DESC sampDesc = {};
+    sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    hr = m_device->CreateSamplerState(&sampDesc, &m_sampler);
+    if (FAILED(hr)) {
+        LOG_ERROR("D3D11: CreateSamplerState failed: 0x%08X", hr);
+        return false;
     }
 
     return true;
@@ -106,7 +251,7 @@ bool D3d11Renderer::CreateSwapChain(HWND hwnd) {
     sc1->Release();
     if (FAILED(hr)) return false;
 
-    // Get back buffer
+    // Get back buffer and create RTV
     ID3D11Texture2D* backBuffer = nullptr;
     hr = m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
     if (FAILED(hr)) return false;
@@ -115,7 +260,24 @@ bool D3d11Renderer::CreateSwapChain(HWND hwnd) {
     backBuffer->Release();
     if (FAILED(hr)) return false;
 
-    m_context->OMSetRenderTargets(1, &m_rtv, nullptr);
+    // Set up D2D target from the back buffer
+    if (m_d2dContext) {
+        IDXGISurface* dxgiSurface = nullptr;
+        hr = m_swapChain->GetBuffer(0, __uuidof(IDXGISurface), (void**)&dxgiSurface);
+        if (SUCCEEDED(hr)) {
+            D2D1_BITMAP_PROPERTIES1 bp = {};
+            bp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+            bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+            ID2D1Bitmap1* d2dTarget = nullptr;
+            hr = m_d2dContext->CreateBitmapFromDxgiSurface(dxgiSurface, bp, &d2dTarget);
+            if (SUCCEEDED(hr)) {
+                m_d2dContext->SetTarget(d2dTarget);
+                d2dTarget->Release();
+            }
+            dxgiSurface->Release();
+        }
+    }
 
     // Viewport
     D3D11_VIEWPORT vp = {};
@@ -128,7 +290,15 @@ bool D3d11Renderer::CreateSwapChain(HWND hwnd) {
 }
 
 void D3d11Renderer::Shutdown() {
-    if (m_d2dContext) m_d2dContext->Release();
+    if (m_d2dContext) {
+        m_d2dContext->SetTarget(nullptr);
+        m_d2dContext->Release();
+    }
+    if (m_inputLayout) m_inputLayout->Release();
+    if (m_pixelShader) m_pixelShader->Release();
+    if (m_vertexShader) m_vertexShader->Release();
+    if (m_quadVB) m_quadVB->Release();
+    if (m_sampler) m_sampler->Release();
     if (m_videoSRV) m_videoSRV->Release();
     if (m_videoTexture) m_videoTexture->Release();
     if (m_rtv) m_rtv->Release();
@@ -137,6 +307,11 @@ void D3d11Renderer::Shutdown() {
     if (m_device) m_device->Release();
 
     m_d2dContext = nullptr;
+    m_inputLayout = nullptr;
+    m_pixelShader = nullptr;
+    m_vertexShader = nullptr;
+    m_quadVB = nullptr;
+    m_sampler = nullptr;
     m_videoSRV = nullptr;
     m_videoTexture = nullptr;
     m_rtv = nullptr;
@@ -146,18 +321,40 @@ void D3d11Renderer::Shutdown() {
 }
 
 void D3d11Renderer::Resize(uint32_t width, uint32_t height) {
+    if (!m_device || !m_context) return;
+
     m_windowWidth = width;
     m_windowHeight = height;
 
+    if (m_d2dContext) m_d2dContext->SetTarget(nullptr);
     if (m_rtv) { m_rtv->Release(); m_rtv = nullptr; }
 
     if (m_swapChain) {
         m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
         ID3D11Texture2D* backBuffer = nullptr;
-        m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
-        if (backBuffer) {
+        HRESULT hr = m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
+        if (SUCCEEDED(hr)) {
             m_device->CreateRenderTargetView(backBuffer, nullptr, &m_rtv);
             backBuffer->Release();
+
+            // Re-bind D2D target
+            if (m_d2dContext) {
+                IDXGISurface* dxgiSurface = nullptr;
+                hr = m_swapChain->GetBuffer(0, __uuidof(IDXGISurface), (void**)&dxgiSurface);
+                if (SUCCEEDED(hr)) {
+                    D2D1_BITMAP_PROPERTIES1 bp = {};
+                    bp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+                    bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+                    ID2D1Bitmap1* d2dTarget = nullptr;
+                    hr = m_d2dContext->CreateBitmapFromDxgiSurface(dxgiSurface, bp, &d2dTarget);
+                    if (SUCCEEDED(hr)) {
+                        m_d2dContext->SetTarget(d2dTarget);
+                        d2dTarget->Release();
+                    }
+                    dxgiSurface->Release();
+                }
+            }
         }
     }
 
@@ -169,63 +366,78 @@ void D3d11Renderer::Resize(uint32_t width, uint32_t height) {
 }
 
 void D3d11Renderer::RenderFrame(const uint8_t* rgbaData, uint32_t width, uint32_t height) {
-    if (!m_device || !m_context) return;
+    if (!m_device || !m_context || !m_rtv) return;
 
     // Clear to black
     float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     m_context->ClearRenderTargetView(m_rtv, clearColor);
 
-    if (!rgbaData || width == 0 || height == 0) return;
+    if (rgbaData && width > 0 && height > 0) {
+        // Recreate texture if dimensions changed
+        if (!m_videoTexture || m_textureWidth != width || m_textureHeight != height) {
+            if (m_videoSRV) { m_videoSRV->Release(); m_videoSRV = nullptr; }
+            if (m_videoTexture) { m_videoTexture->Release(); m_videoTexture = nullptr; }
 
-    // Recreate texture if dimensions changed
-    if (!m_videoTexture || m_textureWidth != width || m_textureHeight != height) {
-        if (m_videoSRV) m_videoSRV->Release();
-        if (m_videoTexture) m_videoTexture->Release();
+            D3D11_TEXTURE2D_DESC desc = {};
+            desc.Width = width;
+            desc.Height = height;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            desc.Usage = D3D11_USAGE_DYNAMIC;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-        D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = width;
-        desc.Height = height;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DYNAMIC;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            HRESULT hr = m_device->CreateTexture2D(&desc, nullptr, &m_videoTexture);
+            if (SUCCEEDED(hr)) {
+                hr = m_device->CreateShaderResourceView(m_videoTexture, nullptr, &m_videoSRV);
+                if (FAILED(hr)) {
+                    m_videoTexture->Release();
+                    m_videoTexture = nullptr;
+                }
+            }
+            m_textureWidth = width;
+            m_textureHeight = height;
+        }
 
-        HRESULT hr = m_device->CreateTexture2D(&desc, nullptr, &m_videoTexture);
-        if (FAILED(hr)) return;
-
-        hr = m_device->CreateShaderResourceView(m_videoTexture, nullptr, &m_videoSRV);
-        if (FAILED(hr)) return;
-
-        m_textureWidth = width;
-        m_textureHeight = height;
-    }
-
-    // Update texture with new frame data
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    HRESULT hr = m_context->Map(m_videoTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        size_t rowSize = width * 4;
-        // BGRA input matches DXGI_FORMAT_B8G8R8A8_UNORM
-        if (mapped.RowPitch == rowSize) {
-            memcpy(mapped.pData, rgbaData, rowSize * height);
-        } else {
-            for (uint32_t row = 0; row < height; ++row) {
-                memcpy(static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch,
-                       rgbaData + row * rowSize, rowSize);
+        // Update texture with new frame data
+        if (m_videoTexture) {
+            D3D11_MAPPED_SUBRESOURCE mapped = {};
+            HRESULT hr = m_context->Map(m_videoTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+            if (SUCCEEDED(hr)) {
+                size_t rowSize = width * 4;
+                if (mapped.RowPitch == rowSize) {
+                    memcpy(mapped.pData, rgbaData, rowSize * height);
+                } else {
+                    for (uint32_t row = 0; row < height; ++row) {
+                        memcpy(static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch,
+                               rgbaData + row * rowSize, rowSize);
+                    }
+                }
+                m_context->Unmap(m_videoTexture, 0);
             }
         }
-        m_context->Unmap(m_videoTexture, 0);
+
+        // Draw the video texture as a fullscreen triangle
+        if (m_videoSRV && m_quadVB && m_vertexShader && m_pixelShader && m_sampler) {
+            UINT stride = sizeof(QuadVertex);
+            UINT offset = 0;
+            m_context->IASetVertexBuffers(0, 1, &m_quadVB, &stride, &offset);
+            m_context->IASetInputLayout(m_inputLayout);
+            m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            m_context->VSSetShader(m_vertexShader, nullptr, 0);
+            m_context->PSSetShader(m_pixelShader, nullptr, 0);
+            m_context->PSSetShaderResources(0, 1, &m_videoSRV);
+            m_context->PSSetSamplers(0, 1, &m_sampler);
+            m_context->OMSetRenderTargets(1, &m_rtv, nullptr);
+            m_context->Draw(3, 0);
+        }
     }
 }
 
 void D3d11Renderer::Present() {
     if (m_swapChain) {
-        m_swapChain->Present(1, 0); // VSync on
+        m_swapChain->Present(1, 0);
     }
 }
-
-// Helper to create a D2D bitmap from the current video texture
-// (used by D2dOverlay to render stats on top of video)
