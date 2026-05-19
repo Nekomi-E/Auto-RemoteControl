@@ -27,6 +27,7 @@ public:
         m_screenWidth = width;
         m_screenHeight = height;
     }
+    void SetCodecType(uint32_t codecType) { m_codecType = codecType; }
 
     // Control messages (TCP)
     bool SendControlMessage(const Protocol::ControlMessage& msg);
@@ -58,4 +59,5 @@ private:
 
     std::atomic<uint32_t> m_screenWidth{1920};
     std::atomic<uint32_t> m_screenHeight{1080};
+    std::atomic<uint32_t> m_codecType{0};  // 0=H.264, 1=HEVC
 };

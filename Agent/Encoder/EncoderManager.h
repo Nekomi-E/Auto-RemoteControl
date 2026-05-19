@@ -4,6 +4,9 @@
 #include <memory>
 #include <atomic>
 
+struct ID3D11Device;
+struct ID3D11DeviceContext;
+
 class EncoderManager {
 public:
     struct EncodedFrame {
@@ -25,7 +28,9 @@ public:
     ~EncoderManager();
 
     bool Initialize(uint32_t width, uint32_t height, uint32_t bitrate,
-                    uint32_t fps, bool enableAudio);
+                    uint32_t fps, bool enableAudio,
+                    ID3D11Device* d3dDevice = nullptr,
+                    ID3D11DeviceContext* d3dContext = nullptr);
     void Stop();
 
     void SubmitVideoFrame(const std::vector<uint8_t>& rawData,
@@ -41,6 +46,7 @@ public:
 
     uint32_t GetEncoderWidth() const;
     uint32_t GetEncoderHeight() const;
+    uint32_t GetCodecType() const;  // 0=H.264, 1=HEVC
 
     Stats GetStats() const;
 

@@ -8,7 +8,7 @@ public:
     MfVideoDecoder();
     ~MfVideoDecoder();
 
-    bool Initialize();
+    bool Initialize(uint32_t codecType, uint32_t width, uint32_t height);
     void Shutdown();
 
     bool DecodeFrame(const uint8_t* bitstream, size_t len,

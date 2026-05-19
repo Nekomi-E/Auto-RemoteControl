@@ -2,6 +2,7 @@
 #include "MfVideoEncoder.h"
 #include "MfAudioEncoder.h"
 #include "Common/Utils/Logger.h"
+#include <d3d11.h>
 #include "Common/Utils/Timer.h"
 #include "Common/Utils/RingBuffer.h"
 #include "Common/Utils/ThreadSafeQueue.h"
@@ -49,7 +50,7 @@ struct EncoderManager::Impl {
 
     uint32_t frameWidth = 1920;
     uint32_t frameHeight = 1080;
-    uint32_t targetBitrate = 4000000;
+    uint32_t targetBitrate = 0;       // 0 = auto
     uint32_t targetFps = 30;
 };
 
@@ -58,7 +59,8 @@ EncoderManager::EncoderManager() : m_impl(std::make_unique<Impl>()) {}
 EncoderManager::~EncoderManager() { Stop(); }
 
 bool EncoderManager::Initialize(uint32_t width, uint32_t height, uint32_t bitrate,
-                                 uint32_t fps, bool enableAudio) {
+                                 uint32_t fps, bool enableAudio,
+                                 ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext) {
     m_impl->frameWidth = width;
     m_impl->frameHeight = height;
     m_impl->targetBitrate = bitrate;
@@ -67,12 +69,12 @@ bool EncoderManager::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
 
     // Initialize video encoder
     m_impl->videoEncoder = std::make_unique<MfVideoEncoder>();
-    if (!m_impl->videoEncoder->Initialize(width, height, bitrate, fps)) {
+    if (!m_impl->videoEncoder->Initialize(width, height, bitrate, fps,
+                                           d3dDevice, d3dContext)) {
         LOG_ERROR("Failed to initialize video encoder");
         return false;
     }
-    LOG_INFO("Video encoder initialized: %ux%u, %u bps, %u fps",
-             width, height, bitrate, fps);
+    LOG_INFO("Video encoder initialized");
 
     // Initialize audio encoder if enabled
     if (enableAudio) {
@@ -214,6 +216,10 @@ uint32_t EncoderManager::GetEncoderWidth() const {
 
 uint32_t EncoderManager::GetEncoderHeight() const {
     return m_impl->videoEncoder ? m_impl->videoEncoder->GetHeight() : 1080;
+}
+
+uint32_t EncoderManager::GetCodecType() const {
+    return m_impl->videoEncoder ? m_impl->videoEncoder->GetCodecType() : 0;
 }
 
 void EncoderManager::RequestKeyFrame() {

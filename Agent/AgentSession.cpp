@@ -65,7 +65,8 @@ bool AgentSession::Initialize(const AgentConfig& config) {
     uint32_t encHeight = monitors[0].height;
     if (!m_encoderMgr->Initialize(encWidth, encHeight,
                                    m_config.videoBitrate, m_config.targetFps,
-                                   m_config.enableAudio)) {
+                                   m_config.enableAudio,
+                                   m_captureMgr->GetD3DDevice(), nullptr)) {
         LOG_ERROR("Failed to initialize encoders");
         m_running = false;
         m_network->Shutdown();
@@ -76,14 +77,17 @@ bool AgentSession::Initialize(const AgentConfig& config) {
     // Notify network of actual encoder resolution (may differ from monitor due to HW limits)
     uint32_t actualEncWidth = m_encoderMgr->GetEncoderWidth();
     uint32_t actualEncHeight = m_encoderMgr->GetEncoderHeight();
+    uint32_t codecType = m_encoderMgr->GetCodecType();
     m_network->SetScreenInfo(actualEncWidth, actualEncHeight);
+    m_network->SetCodecType(codecType);
 
     LOG_INFO("  Encoder resolution: %ux%u (monitor: %ux%u)",
              actualEncWidth, actualEncHeight, encWidth, encHeight);
 
     LOG_INFO("Agent initialized successfully");
-    LOG_INFO("  Monitor: %ux%u, Bitrate: %u bps, FPS: %u",
-             encWidth, encHeight, m_config.videoBitrate, m_config.targetFps);
+    LOG_INFO("  Encoder: %ux%u, FPS: %u, Codec: %s",
+             encWidth, encHeight, m_config.targetFps,
+             codecType == 1 ? "HEVC" : "H.264");
     return true;
 }
 

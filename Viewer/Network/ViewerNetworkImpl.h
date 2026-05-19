@@ -34,6 +34,7 @@ public:
 
     uint32_t GetRemoteWidth() const { return m_remoteWidth; }
     uint32_t GetRemoteHeight() const { return m_remoteHeight; }
+    uint32_t GetCodecType() const { return m_codecType; }
     float GetFps() const { return m_fps; }
 
 private:
@@ -54,6 +55,7 @@ private:
 
     uint32_t m_remoteWidth = 1920;
     uint32_t m_remoteHeight = 1080;
+    uint32_t m_codecType = 0;  // 0=H.264, 1=HEVC
     float m_fps = 0;
 
     // Fragment reassembly

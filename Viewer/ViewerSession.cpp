@@ -35,10 +35,12 @@ bool ViewerSession::Initialize(const ViewerConfig& config) {
     // Get remote screen info from session start
     m_remoteWidth = m_network->GetRemoteWidth();
     m_remoteHeight = m_network->GetRemoteHeight();
+    uint32_t codecType = m_network->GetCodecType();
 
     // Initialize decoders
-    if (!m_videoDecoder->Initialize()) {
-        LOG_ERROR("Failed to initialize video decoder");
+    if (!m_videoDecoder->Initialize(codecType, m_remoteWidth, m_remoteHeight)) {
+        LOG_ERROR("Failed to initialize video decoder (codec: %s)",
+                  codecType == 1 ? "HEVC" : "H.264");
         return false;
     }
 
@@ -58,8 +60,9 @@ bool ViewerSession::Initialize(const ViewerConfig& config) {
         }
     }
 
-    LOG_INFO("Viewer session initialized, remote screen: %ux%u",
-             m_remoteWidth, m_remoteHeight);
+    LOG_INFO("Viewer session initialized, remote screen: %ux%u codec: %s",
+             m_remoteWidth, m_remoteHeight,
+             codecType == 1 ? "HEVC" : "H.264");
     return true;
 }
 

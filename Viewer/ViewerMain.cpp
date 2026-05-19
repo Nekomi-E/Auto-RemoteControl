@@ -12,6 +12,11 @@ ViewerSession* g_session = nullptr;
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     (void)nCmdShow;
 
+    // Declare DPI awareness so GetClientRect / SPI_GETWORKAREA return physical
+    // pixels. Without this, on high-DPI displays the swap chain is created at
+    // logical size and then stretched by DWM, causing double-scaling blur.
+    SetProcessDPIAware();
+
     Logger::Instance().SetLevel(LogLevel::Debug);
 
     // Parse command line

@@ -248,6 +248,7 @@ bool AgentNetworkImpl::PerformHandshake() {
     startMsg.type = Protocol::MessageType::SESSION_START;
     startMsg.screenWidth = m_screenWidth.load();
     startMsg.screenHeight = m_screenHeight.load();
+    startMsg.codecType = m_codecType.load();
     SendControlMessage(startMsg);
 
     LOG_INFO("Session handshake complete");

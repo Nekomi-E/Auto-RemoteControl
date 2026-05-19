@@ -248,8 +248,10 @@ bool ViewerNetworkImpl::PerformHandshake() {
 
     if (startMsg->screenWidth)  m_remoteWidth  = *startMsg->screenWidth;
     if (startMsg->screenHeight) m_remoteHeight = *startMsg->screenHeight;
-    LOG_INFO("Session handshake complete, remote screen: %ux%u",
-             m_remoteWidth, m_remoteHeight);
+    if (startMsg->codecType)    m_codecType    = *startMsg->codecType;
+    LOG_INFO("Session handshake complete, remote screen: %ux%u codec: %s",
+             m_remoteWidth, m_remoteHeight,
+             m_codecType == 1 ? "HEVC" : "H.264");
     return true;
 }
 

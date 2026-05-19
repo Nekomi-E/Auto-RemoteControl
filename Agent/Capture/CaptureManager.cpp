@@ -4,6 +4,7 @@
 #include "Common/Utils/Logger.h"
 #include "Common/Utils/Timer.h"
 #include <d3d11.h>
+#include <dxgi1_2.h>
 
 struct CaptureManager::Impl {
     std::unique_ptr<DxgiScreenCapture> screenCapture;
@@ -31,8 +32,14 @@ CaptureManager::~CaptureManager() { Stop(); }
 bool CaptureManager::Initialize(uint32_t targetFps) {
     m_impl->targetFps = targetFps;
 
-    // Create D3D11 device shared between capture and encoder
-    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    // Create D3D11 device shared between capture and encoder.
+    // D3D11_CREATE_DEVICE_VIDEO_SUPPORT is required for Intel QuickSync and
+    // other hardware MFTs to accept the device via MFT_MESSAGE_SET_D3D_MANAGER.
+    // On multi-GPU systems (e.g. Optimus laptops) the default adapter may be
+    // the dGPU; we need the adapter that owns the display outputs so DXGI
+    // Desktop Duplication and the hardware encoder share the same GPU.
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT
+               | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
 #ifdef _DEBUG
     flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
@@ -41,13 +48,62 @@ bool CaptureManager::Initialize(uint32_t targetFps) {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0
     };
 
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+    // Find the adapter with display outputs for DXGI Desktop Duplication.
+    // On Optimus laptops the NVIDIA dGPU typically owns the display outputs.
+    IDXGIAdapter* chosenAdapter = nullptr;
+    {
+        IDXGIFactory1* factory = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) {
+            IDXGIAdapter1* adap = nullptr;
+            for (UINT i = 0; factory->EnumAdapters1(i, &adap) != DXGI_ERROR_NOT_FOUND; ++i) {
+                IDXGIOutput* out = nullptr;
+                bool hasOutputs = (adap->EnumOutputs(0, &out) != DXGI_ERROR_NOT_FOUND);
+                if (out) out->Release();
+
+                DXGI_ADAPTER_DESC1 desc;
+                adap->GetDesc1(&desc);
+                LOG_INFO("  Adapter %u: %S (vendor=0x%04X device=0x%04X flags=0x%X)%s",
+                         i, desc.Description, desc.VendorId, desc.DeviceId,
+                         desc.Flags, hasOutputs ? " [has outputs]" : "");
+
+                if (hasOutputs && !chosenAdapter) {
+                    chosenAdapter = adap;
+                    chosenAdapter->AddRef();
+                }
+                adap->Release();
+            }
+            factory->Release();
+        }
+    }
+
+    HRESULT hr = D3D11CreateDevice(chosenAdapter,
+                                    chosenAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+                                    nullptr, flags,
                                     featureLevels, ARRAYSIZE(featureLevels),
                                     D3D11_SDK_VERSION,
                                     &m_impl->d3dDevice, nullptr, &m_impl->d3dContext);
+    if (chosenAdapter) chosenAdapter->Release();
+
     if (FAILED(hr)) {
         LOG_ERROR("D3D11CreateDevice failed: 0x%08X", hr);
         return false;
+    }
+
+    // Log which adapter the device landed on
+    {
+        IDXGIDevice* dxgiDev = nullptr;
+        if (SUCCEEDED(m_impl->d3dDevice->QueryInterface(
+                          __uuidof(IDXGIDevice), (void**)&dxgiDev))) {
+            IDXGIAdapter* adap = nullptr;
+            if (SUCCEEDED(dxgiDev->GetAdapter(&adap))) {
+                DXGI_ADAPTER_DESC desc;
+                if (SUCCEEDED(adap->GetDesc(&desc))) {
+                    LOG_INFO("D3D11 device created on: %S", desc.Description);
+                }
+                adap->Release();
+            }
+            dxgiDev->Release();
+        }
     }
 
     // Init screen capture

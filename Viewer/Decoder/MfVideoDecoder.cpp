@@ -20,9 +20,10 @@ struct MfVideoDecoder::Impl {
     bool initialized = false;
     uint32_t width = 0;
     uint32_t height = 0;
-    int32_t yStride = 0;  // row stride for Y plane (may be > width due to alignment)
+    int32_t yStride = 0;
     bool formatEstablished = false;
     GUID outputSubtype = GUID_NULL;
+    GUID inputSubtype = GUID_NULL;
     int64_t sampleTime = 0;
 };
 
@@ -30,15 +31,19 @@ MfVideoDecoder::MfVideoDecoder() : m_impl(std::make_unique<Impl>()) {}
 
 MfVideoDecoder::~MfVideoDecoder() { Shutdown(); }
 
-bool MfVideoDecoder::Initialize() {
+bool MfVideoDecoder::Initialize(uint32_t codecType, uint32_t width, uint32_t height) {
     HRESULT hr = MFStartup(MF_VERSION);
     if (FAILED(hr)) {
         LOG_ERROR("MFStartup failed: 0x%08X", hr);
         return false;
     }
 
-    // Find H.264 decoder
-    MFT_REGISTER_TYPE_INFO inputInfo = { MFMediaType_Video, MFVideoFormat_H264 };
+    GUID inputSubtype = (codecType == 1) ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+    const char* codecName = (codecType == 1) ? "HEVC" : "H.264";
+    m_impl->inputSubtype = inputSubtype;
+
+    // Find decoder for the requested codec
+    MFT_REGISTER_TYPE_INFO inputInfo = { MFMediaType_Video, inputSubtype };
     MFT_REGISTER_TYPE_INFO outputInfo = { MFMediaType_Video, MFVideoFormat_NV12 };
 
     IMFActivate** activates = nullptr;
@@ -48,12 +53,12 @@ bool MfVideoDecoder::Initialize() {
                    &inputInfo, &outputInfo, &activates, &count);
 
     if (FAILED(hr) || count == 0) {
-        // Try software
         hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_SYNCMFT,
                        &inputInfo, &outputInfo, &activates, &count);
     }
     if (FAILED(hr) || count == 0) {
-        LOG_ERROR("No H.264 decoder found (MFTEnumEx returned hr=0x%08X, count=%u)", hr, count);
+        LOG_ERROR("No %s decoder found (MFTEnumEx returned hr=0x%08X, count=%u)",
+                  codecName, hr, count);
         return false;
     } else {
         hr = activates[0]->ActivateObject(IID_PPV_ARGS(&m_impl->mft));
@@ -62,20 +67,42 @@ bool MfVideoDecoder::Initialize() {
         if (FAILED(hr)) return false;
     }
 
-    // Set input type (H.264)
+    // Set input type with known frame size so the decoder can negotiate output types.
+    // HEVC decoders (e.g. Microsoft HEVC Video Extension) require a complete input
+    // media type and will reject ProcessInput with MF_E_TRANSFORM_TYPE_NOT_SET otherwise.
+    bool inputTypeSet = false;
     IMFMediaType* inputType = nullptr;
     hr = MFCreateMediaType(&inputType);
     if (SUCCEEDED(hr)) {
         inputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        inputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-        hr = m_impl->mft->SetInputType(0, inputType, 0);
-        inputType->Release();
-        if (FAILED(hr)) {
-            LOG_WARNING("Decoder SetInputType failed: 0x%08X (will try auto-detect)", hr);
+        inputType->SetGUID(MF_MT_SUBTYPE, inputSubtype);
+        MFSetAttributeSize(inputType, MF_MT_FRAME_SIZE, width, height);
+        IMFAttributes* inputAttrs = nullptr;
+        if (SUCCEEDED(inputType->QueryInterface(IID_PPV_ARGS(&inputAttrs)))) {
+            inputAttrs->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+            inputAttrs->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
+            inputAttrs->Release();
         }
+        hr = m_impl->mft->SetInputType(0, inputType, 0);
+        if (SUCCEEDED(hr)) {
+            inputTypeSet = true;
+            LOG_INFO("Decoder input type set: %ux%u %s", width, height, codecName);
+        } else {
+            LOG_WARNING("Decoder SetInputType(%ux%u) failed: 0x%08X, trying without frame size",
+                        width, height, hr);
+            // Retry with bare type (no frame size) as fallback
+            inputType->SetGUID(MF_MT_SUBTYPE, inputSubtype);
+            hr = m_impl->mft->SetInputType(0, inputType, 0);
+            if (SUCCEEDED(hr)) {
+                inputTypeSet = true;
+            } else {
+                LOG_WARNING("Decoder SetInputType (bare) failed: 0x%08X", hr);
+            }
+        }
+        inputType->Release();
     }
 
-    // Enumerate available output types — the decoder may not support NV12 directly
+    // Enumerate available output types
     GUID selectedSubtype = GUID_NULL;
     static const GUID* preferredSubtypes[] = {
         &MFVideoFormat_NV12, &MFVideoFormat_YV12, &MFVideoFormat_IYUV,
@@ -106,8 +133,10 @@ bool MfVideoDecoder::Initialize() {
     }
     m_impl->outputSubtype = selectedSubtype;
 
-    LOG_INFO("H.264 decoder MFT created");
-    m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    LOG_INFO("%s decoder MFT created", codecName);
+    if (inputTypeSet) {
+        m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    }
     m_impl->initialized = true;
     return true;
 }

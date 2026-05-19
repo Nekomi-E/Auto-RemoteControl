@@ -107,6 +107,7 @@ std::string ControlMessage::toJson() const {
     if (errorMessage) ss << ",\"errorMessage\":\"" << escapeJson(*errorMessage) << "\"";
     if (screenWidth)  ss << ",\"screenWidth\":" << *screenWidth;
     if (screenHeight) ss << ",\"screenHeight\":" << *screenHeight;
+    if (codecType)    ss << ",\"codecType\":" << *codecType;
     if (targetBitrate) ss << ",\"targetBitrate\":" << *targetBitrate;
     if (targetFps)  ss << ",\"targetFps\":" << *targetFps;
 
@@ -164,6 +165,7 @@ std::optional<ControlMessage> ControlMessage::fromJson(const std::string& json) 
         ? std::make_optional(static_cast<uint16_t>(extractUint(json, "udpPort").value_or(0))) : std::nullopt;
     msg.screenWidth = extractUint(json, "screenWidth");
     msg.screenHeight = extractUint(json, "screenHeight");
+    msg.codecType = extractUint(json, "codecType");
     msg.targetBitrate = extractUint(json, "targetBitrate");
     msg.targetFps = extractUint(json, "targetFps");
 

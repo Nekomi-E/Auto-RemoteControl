@@ -78,6 +78,7 @@ public:
     // Session info
     std::optional<uint32_t> screenWidth;
     std::optional<uint32_t> screenHeight;
+    std::optional<uint32_t> codecType;    // 0=H.264, 1=HEVC
 
     // Quality
     std::optional<uint32_t> targetBitrate;
