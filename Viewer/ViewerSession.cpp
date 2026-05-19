@@ -247,6 +247,7 @@ void ViewerSession::RenderThread() {
     int64_t lastFrameTime = Timer::NowMs();
     uint32_t frameCount = 0;
     int64_t lastStatsTime = lastFrameTime;
+    int64_t lastFpsUpdateTime = lastFrameTime;
     uint32_t lastDecodedCount = 0;
 
     while (m_running) {
@@ -264,8 +265,18 @@ void ViewerSession::RenderThread() {
         RenderFrame();
         frameCount++;
 
-        // Pace to target frame rate (default 60fps)
         auto now = Timer::NowMs();
+
+        // Update decoded FPS every second for smooth overlay display
+        if (now - lastFpsUpdateTime >= 1000) {
+            uint32_t decodedNow = m_decodedFrameCount.load();
+            m_decodedFps = static_cast<float>(
+                (decodedNow - lastDecodedCount) * 1000.0f / (now - lastFpsUpdateTime));
+            lastDecodedCount = decodedNow;
+            lastFpsUpdateTime = now;
+        }
+
+        // Pace to target frame rate (default 60fps)
         int64_t targetInterval = 1000 / 60;
         int64_t elapsed = now - lastFrameTime;
         if (elapsed < targetInterval) {
@@ -273,13 +284,9 @@ void ViewerSession::RenderThread() {
         }
         lastFrameTime = Timer::NowMs();
 
-        // Periodic stats — report actual video FPS (decoded frames) vs render rate
+        // Periodic stats (5s interval) — more detailed log
         if (now - lastStatsTime >= 5000) {
             double renderFps = frameCount * 1000.0 / (now - lastStatsTime);
-            uint32_t decodedNow = m_decodedFrameCount.load();
-            m_decodedFps = static_cast<float>(
-                (decodedNow - lastDecodedCount) * 1000.0 / (now - lastStatsTime));
-            lastDecodedCount = decodedNow;
             LOG_INFO("[Render] render=%.1f fps  video=%.1f fps  frames=%u",
                      renderFps, m_decodedFps, frameCount);
             frameCount = 0;

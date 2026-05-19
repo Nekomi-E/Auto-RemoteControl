@@ -17,7 +17,7 @@ public:
     void Start();
     void Stop();
 
-    // Called by message loop
+    // Called by render thread only
     void RenderFrame();
     void OnResize(uint32_t width, uint32_t height);
     void OnKeyEvent(UINT msg, WPARAM wParam, LPARAM lParam);
