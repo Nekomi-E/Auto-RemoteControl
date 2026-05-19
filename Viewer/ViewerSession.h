@@ -1,0 +1,86 @@
+#pragma once
+#include "Common/Utils/Config.h"
+#include "Common/Utils/ThreadSafeQueue.h"
+#include "Common/Protocol/ControlMessage.h"
+#include <memory>
+#include <atomic>
+#include <thread>
+#include <vector>
+#include <windows.h>
+
+class ViewerSession {
+public:
+    ViewerSession();
+    ~ViewerSession();
+
+    bool Initialize(const ViewerConfig& config);
+    void Start();
+    void Stop();
+
+    // Called by message loop
+    void RenderFrame();
+    void OnResize(uint32_t width, uint32_t height);
+    void OnKeyEvent(UINT msg, WPARAM wParam, LPARAM lParam);
+    void OnMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam);
+    void OnRawInput(HRAWINPUT hRawInput);
+
+    void SetRenderWindow(HWND hwnd);
+    uint32_t GetRemoteWidth() const { return m_remoteWidth; }
+    uint32_t GetRemoteHeight() const { return m_remoteHeight; }
+
+private:
+    void NetworkReceiveThread();
+    void VideoDecodeThread();
+    void AudioDecodeThread();
+    void InputSendThread();
+
+    ViewerConfig m_config;
+    std::atomic<bool> m_running{false};
+
+    // Network
+    std::unique_ptr<class ViewerNetworkImpl> m_network;
+
+    // Decoders
+    std::unique_ptr<class MfVideoDecoder> m_videoDecoder;
+    std::unique_ptr<class MfAudioDecoder> m_audioDecoder;
+
+    // Renderers
+    std::unique_ptr<class D3d11Renderer> m_renderer;
+    std::unique_ptr<class WasapiAudioRenderer> m_audioRenderer;
+    std::unique_ptr<class D2dOverlay> m_overlay;
+
+    // Queues
+    struct VideoPacket {
+        std::vector<uint8_t> data;
+        bool isKeyFrame = false;
+        uint32_t timestampMs = 0;
+    };
+    struct AudioPacket {
+        std::vector<uint8_t> data;
+        uint32_t timestampMs = 0;
+    };
+    struct DecodedFrame {
+        std::vector<uint8_t> data; // RGBA for renderer
+        uint32_t width = 0;
+        uint32_t height = 0;
+    };
+
+    ThreadSafeQueue<VideoPacket> m_videoQueue{64};
+    ThreadSafeQueue<AudioPacket> m_audioQueue{128};
+    ThreadSafeQueue<Protocol::InputEvent> m_inputSendQueue{64};
+
+    // Latest decoded frame for rendering
+    std::mutex m_frameMutex;
+    DecodedFrame m_latestFrame;
+
+    // Threads
+    std::vector<std::thread> m_threads;
+
+    // Remote info (set after handshake)
+    uint32_t m_remoteWidth = 1920;
+    uint32_t m_remoteHeight = 1080;
+    HWND m_hwnd = nullptr;
+    uint32_t m_windowWidth = 0;
+    uint32_t m_windowHeight = 0;
+    std::atomic<bool> m_inputActive{false};
+};
