@@ -67,7 +67,8 @@ bool AgentSession::Initialize(const AgentConfig& config) {
     if (!m_encoderMgr->Initialize(encWidth, encHeight,
                                    m_config.videoBitrate, m_config.targetFps,
                                    m_config.enableAudio,
-                                   m_captureMgr->GetD3DDevice(), nullptr)) {
+                                   m_captureMgr->GetD3DDevice(),
+                                   m_captureMgr->GetD3DContext())) {
         LOG_ERROR("Failed to initialize encoders");
         m_running = false;
         m_network->Shutdown();

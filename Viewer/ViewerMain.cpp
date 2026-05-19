@@ -93,18 +93,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // Start session threads
     session.Start();
 
-    // Message loop
+    // Message loop — rendering is handled by a dedicated thread so that
+    // window drags (modal message loops) don't block video playback.
     MSG msg = {};
     while (msg.message != WM_QUIT) {
         if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         } else {
-            // Render the latest frame
-            session.RenderFrame();
-
-            // Process window events
+            // Check for input mode toggle (Scroll Lock)
             window.ProcessPendingEvents(session);
+            Sleep(1);  // avoid busy-waiting when idle
         }
     }
 

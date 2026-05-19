@@ -29,6 +29,7 @@ public:
     uint32_t GetRemoteHeight() const { return m_remoteHeight; }
 
 private:
+    void RenderThread();
     void NetworkReceiveThread();
     void VideoDecodeThread();
     void AudioDecodeThread();
@@ -72,6 +73,16 @@ private:
     // Latest decoded frame for rendering
     std::mutex m_frameMutex;
     DecodedFrame m_latestFrame;
+
+    // Decoded frame rate tracking (actual video FPS, not render/packet rate)
+    std::atomic<uint32_t> m_decodedFrameCount{0};
+    float m_decodedFps = 0.0f;
+
+    // Resize synchronization (main thread → render thread)
+    std::mutex m_renderMutex;
+    bool m_pendingResize = false;
+    uint32_t m_pendingWidth = 0;
+    uint32_t m_pendingHeight = 0;
 
     // Threads
     std::vector<std::thread> m_threads;

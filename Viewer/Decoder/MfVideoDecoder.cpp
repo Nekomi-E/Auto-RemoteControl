@@ -1,5 +1,6 @@
 #include "MfVideoDecoder.h"
 #include "Common/Utils/Logger.h"
+#include "Common/Utils/WorkerThreadPool.h"
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -8,7 +9,6 @@
 #include <codecapi.h>
 #include <wmcodecdsp.h>
 #include <cstring>
-#include <future>
 #include <thread>
 
 #pragma comment(lib, "mfplat.lib")
@@ -234,18 +234,18 @@ static void Nv12ToBgraParallel(const uint8_t* nv12, uint32_t width, uint32_t hei
     }
     if (nThreads > 8) nThreads = 8;
 
-    uint32_t rowsPerThread = (height + nThreads - 1) / nThreads;
-    std::vector<std::future<void>> futures;
+    static WorkerThreadPool pool(nThreads);
 
+    uint32_t rowsPerThread = (height + nThreads - 1) / nThreads;
     for (unsigned int t = 0; t < nThreads; ++t) {
         uint32_t start = t * rowsPerThread;
         if (start >= height) break;
         uint32_t end = (start + rowsPerThread < height) ? start + rowsPerThread : height;
-        futures.push_back(std::async(std::launch::async,
-            Nv12ToBgraChunk, yPlane, uvPlane, width, height, yStride,
-            start, end, dst));
+        pool.Enqueue([=] {
+            Nv12ToBgraChunk(yPlane, uvPlane, width, height, yStride, start, end, dst);
+        });
     }
-    for (auto& f : futures) f.get();
+    pool.WaitAll();
 }
 
 // YV12: Y (stride=yStride), V (stride=yStride/2), U (stride=yStride/2)
