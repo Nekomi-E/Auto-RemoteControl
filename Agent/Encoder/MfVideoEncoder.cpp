@@ -53,6 +53,9 @@ bool MfVideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
         LOG_WARNING("Hardware encoder rejected %ux%u, falling back to software encoder",
                     width, height);
         Shutdown();
+        // Software H.264 encoder is limited to 1920x1080 on most systems
+        if (m_impl->width > 1920) m_impl->width = 1920;
+        if (m_impl->height > 1080) m_impl->height = 1080;
         if (MFStartup(MF_VERSION) == S_OK && InitMFT(true) && ConfigureMediaTypes()) {
             LOG_INFO("Software encoder fallback succeeded");
         } else {

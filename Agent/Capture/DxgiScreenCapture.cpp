@@ -134,11 +134,9 @@ bool DxgiScreenCapture::AcquireFrame(CapturedFrame& outFrame) {
     }
     m_lastFrameTime = now;
 
-    // Cycle through monitors
-    int monitorIndex = m_currentMonitor % static_cast<int>(m_monitors.size());
-    m_currentMonitor++;
-
-    if (AcquireFromMonitor(monitorIndex, outFrame)) {
+    // Capture primary monitor only (monitor 0)
+    // Multi-monitor composition would require stitching frames before encoding
+    if (AcquireFromMonitor(0, outFrame)) {
         outFrame.timestampMs = now;
         return true;
     }

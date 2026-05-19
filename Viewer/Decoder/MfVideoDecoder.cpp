@@ -20,6 +20,7 @@ struct MfVideoDecoder::Impl {
     bool initialized = false;
     uint32_t width = 0;
     uint32_t height = 0;
+    int32_t yStride = 0;  // row stride for Y plane (may be > width due to alignment)
     bool formatEstablished = false;
     GUID outputSubtype = GUID_NULL;
     int64_t sampleTime = 0;
@@ -120,26 +121,30 @@ void MfVideoDecoder::Shutdown() {
     m_impl->mft = nullptr;
 }
 
+// NV12: Y plane (stride=yStride), then interleaved UV plane (same stride).
+// uvOffset: byte offset from start to UV plane.
+//   When 0 (default): uvOffset = yStride * height (tightly-packed buffer).
+//   Set explicitly when content sits in a larger buffer surface.
 static void Nv12ToBgra(const uint8_t* nv12, uint32_t width, uint32_t height,
-                        std::vector<uint8_t>& bgra) {
+                        int32_t yStride, std::vector<uint8_t>& bgra,
+                        size_t uvOffset = 0) {
     bgra.resize(width * height * 4);
 
     const uint8_t* yPlane = nv12;
-    const uint8_t* uvPlane = nv12 + width * height;
+    size_t uvOff = uvOffset ? uvOffset : static_cast<size_t>(yStride) * height;
+    const uint8_t* uvPlane = nv12 + uvOff;
 
     for (uint32_t row = 0; row < height; ++row) {
         for (uint32_t col = 0; col < width; ++col) {
-            int y = yPlane[row * width + col] - 16;
-            int uvIndex = (row / 2) * (width / 2) + (col / 2);
-            int u = uvPlane[uvIndex * 2] - 128;
-            int v = uvPlane[uvIndex * 2 + 1] - 128;
+            int y = yPlane[row * yStride + col] - 16;
+            int uvRowOff = (row / 2) * yStride + (col / 2) * 2;
+            int u = uvPlane[uvRowOff] - 128;
+            int v = uvPlane[uvRowOff + 1] - 128;
 
-            // BT.601 YUV to RGB
             int r = (298 * y + 409 * v + 128) >> 8;
             int g = (298 * y - 100 * u - 208 * v + 128) >> 8;
             int b = (298 * y + 516 * u + 128) >> 8;
 
-            // Clamp
             r = r < 0 ? 0 : (r > 255 ? 255 : r);
             g = g < 0 ? 0 : (g > 255 ? 255 : g);
             b = b < 0 ? 0 : (b > 255 ? 255 : b);
@@ -153,21 +158,22 @@ static void Nv12ToBgra(const uint8_t* nv12, uint32_t width, uint32_t height,
     }
 }
 
-// YV12: Y plane, then V plane, then U plane (planar 4:2:0, like NV12 but separate V/U)
+// YV12: Y (stride=yStride), V (stride=yStride/2), U (stride=yStride/2)
 static void Yv12ToBgra(const uint8_t* yv12, uint32_t width, uint32_t height,
-                        std::vector<uint8_t>& bgra) {
+                        int32_t yStride, std::vector<uint8_t>& bgra) {
     bgra.resize(width * height * 4);
 
+    int32_t cStride = yStride / 2;
     const uint8_t* yPlane = yv12;
-    const uint8_t* vPlane = yv12 + width * height;
-    const uint8_t* uPlane = yv12 + width * height + (width / 2) * (height / 2);
+    const uint8_t* vPlane = yv12 + yStride * height;
+    const uint8_t* uPlane = vPlane + cStride * (height / 2);
 
     for (uint32_t row = 0; row < height; ++row) {
         for (uint32_t col = 0; col < width; ++col) {
-            int y = yPlane[row * width + col] - 16;
-            int uvIndex = (row / 2) * (width / 2) + (col / 2);
-            int v = vPlane[uvIndex] - 128;
-            int u = uPlane[uvIndex] - 128;
+            int y = yPlane[row * yStride + col] - 16;
+            int cOff = (row / 2) * cStride + (col / 2);
+            int v = vPlane[cOff] - 128;
+            int u = uPlane[cOff] - 128;
 
             int r = (298 * y + 409 * v + 128) >> 8;
             int g = (298 * y - 100 * u - 208 * v + 128) >> 8;
@@ -186,14 +192,14 @@ static void Yv12ToBgra(const uint8_t* yv12, uint32_t width, uint32_t height,
     }
 }
 
-// YUY2: packed 4:2:2, 2 bytes per pixel: [Y0 U Y1 V]
+// YUY2: packed [Y0 U Y1 V], stride=yuy2Stride bytes per row
 static void Yuy2ToBgra(const uint8_t* yuy2, uint32_t width, uint32_t height,
-                        std::vector<uint8_t>& bgra) {
+                        int32_t yuy2Stride, std::vector<uint8_t>& bgra) {
     bgra.resize(width * height * 4);
 
     for (uint32_t row = 0; row < height; ++row) {
         for (uint32_t col = 0; col < width; col += 2) {
-            const uint8_t* src = yuy2 + row * width * 2 + col * 2;
+            const uint8_t* src = yuy2 + row * yuy2Stride + col * 2;
             int y0 = src[0] - 16;
             int u  = src[1] - 128;
             int y1 = src[2] - 16;
@@ -224,7 +230,7 @@ static void Yuy2ToBgra(const uint8_t* yuy2, uint32_t width, uint32_t height,
 
 // Helper: handle stream format change by reading new output type
 static bool HandleStreamChange(IMFTransform* mft, uint32_t& width, uint32_t& height,
-                                GUID& subtype, bool& formatEstablished) {
+                                int32_t& yStride, GUID& subtype, bool& formatEstablished) {
     IMFMediaType* newType = nullptr;
     HRESULT hr = mft->GetOutputCurrentType(0, &newType);
     if (FAILED(hr)) return false;
@@ -233,20 +239,99 @@ static bool HandleStreamChange(IMFTransform* mft, uint32_t& width, uint32_t& hei
     MFGetAttributeSize(newType, MF_MT_FRAME_SIZE, &w, &h);
     width = w;
     height = h;
+
+    // Read the actual row stride (may be > width due to alignment)
+    yStride = static_cast<int32_t>(w);  // default fallback
+    UINT32 strideVal = 0;
+    if (SUCCEEDED(newType->GetUINT32(MF_MT_DEFAULT_STRIDE, &strideVal)) && strideVal > 0) {
+        yStride = static_cast<int32_t>(strideVal);
+    }
+
     GUID actualSubtype = {};
     if (SUCCEEDED(newType->GetGUID(MF_MT_SUBTYPE, &actualSubtype))) {
         subtype = actualSubtype;
     }
     formatEstablished = true;
-    LOG_INFO("Decoder stream change: %ux%u subtype=%08X", w, h, subtype.Data1);
+    LOG_INFO("Decoder stream change: %ux%u stride=%d subtype=%08X",
+             w, h, yStride, subtype.Data1);
     newType->Release();
     return true;
 }
 
-// Helper: drain output frames from decoder, handling format changes
-// Returns true if at least one frame was decoded
+// Compute the actual buffer stride and UV-plane offset from the buffer length.
+// contentWidth/contentHeight are from the media type (SPS) — kept unchanged.
+// The decoder surface may differ from the encoded picture due to:
+//   - Encoder padding to macroblock boundaries (multiples of 16)
+//   - Encoder using a different output resolution than SPS reports
+//   - GPU surface pool being larger than the coded picture
+// NV12: bufLen = bufferStride * bufferHeight * 3/2 (contiguous buffer).
+static bool ComputeNv12BufferLayout(DWORD bufLen, uint32_t contentWidth, uint32_t contentHeight,
+                                     int32_t& outStride, size_t& outUvOffset) {
+    size_t expected = static_cast<size_t>(contentWidth) * contentHeight * 3 / 2;
+    if (bufLen == 0 || bufLen == expected) return false;
+
+    uint64_t product = static_cast<uint64_t>(bufLen) * 2 / 3;
+
+    // Search outward from contentWidth in steps of 2.
+    // Encoder typically pads to macroblock-aligned sizes, so the
+    // real stride is usually within a few hundred pixels of contentWidth.
+    for (int32_t delta = 0; delta <= 512; ++delta) {
+        int32_t candidates[2] = {
+            static_cast<int32_t>(contentWidth) - delta,
+            static_cast<int32_t>(contentWidth) + delta
+        };
+        for (int i = 0; i < 2; ++i) {
+            int32_t tryStride = candidates[i];
+            if (delta == 0 && i == 1) continue;  // only try contentWidth once
+            if (tryStride < 64 || tryStride > 4096) continue;
+            if (product % tryStride != 0) continue;
+
+            uint32_t bufferHeight = static_cast<uint32_t>(product / tryStride);
+            // Accept if bufferHeight is within plausible range of contentHeight
+            if (bufferHeight >= contentHeight && bufferHeight <= contentHeight + 256) {
+                outStride = tryStride;
+                outUvOffset = static_cast<size_t>(tryStride) * bufferHeight;
+                static bool loggedOnce = false;
+                if (!loggedOnce) {
+                    LOG_INFO("NV12 buffer layout: content=%ux%u stride=%d bufHeight=%u uvOff=%zu (bufLen=%u)",
+                             contentWidth, contentHeight, outStride, bufferHeight, outUvOffset, bufLen);
+                    loggedOnce = true;
+                }
+                return true;
+            }
+        }
+    }
+
+    // Fallback: common strides with looser height constraint (for larger surfaces)
+    static const uint32_t commonStrides[] = {
+        3840, 3440, 2880, 2560, 2048, 1920, 1856, 1680, 1600, 1440,
+        1366, 1360, 1280, 1152, 1024, 960, 800, 768, 720, 640
+    };
+    for (uint32_t tryStride : commonStrides) {
+        if (product % tryStride == 0) {
+            uint32_t bufferHeight = static_cast<uint32_t>(product / tryStride);
+            if (bufferHeight >= contentHeight) {
+                outStride = static_cast<int32_t>(tryStride);
+                outUvOffset = static_cast<size_t>(tryStride) * bufferHeight;
+                static bool loggedFallback = false;
+                if (!loggedFallback) {
+                    LOG_INFO("NV12 buffer layout (fallback): content=%ux%u stride=%d bufHeight=%u uvOff=%zu (bufLen=%u)",
+                             contentWidth, contentHeight, outStride, bufferHeight, outUvOffset, bufLen);
+                    loggedFallback = true;
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Helper: drain output frames from decoder, handling format changes.
+// Drains ALL available frames and returns the last one (most recent PTS),
+// which avoids showing stale DPB frames that cause black flashing.
+// Returns true if at least one frame was decoded.
 static bool DrainDecoderOutput(IMFTransform* mft, uint32_t& width, uint32_t& height,
-                                GUID& subtype, bool& formatEstablished,
+                                int32_t& yStride, GUID& subtype, bool& formatEstablished,
                                 std::vector<uint8_t>& outRGBA,
                                 uint32_t& outWidth, uint32_t& outHeight,
                                 int& failCount, size_t inputLen) {
@@ -257,7 +342,7 @@ static bool DrainDecoderOutput(IMFTransform* mft, uint32_t& width, uint32_t& hei
 
     DWORD baseBufSize = streamInfo.cbSize ? streamInfo.cbSize : 1920 * 1080 * 3 / 2;
 
-    for (int iter = 0; iter < 5; ++iter) {
+    for (;;) {
         MFT_OUTPUT_DATA_BUFFER outputBuffer = {};
 
         IMFMediaBuffer* outBuf = nullptr;
@@ -285,7 +370,7 @@ static bool DrainDecoderOutput(IMFTransform* mft, uint32_t& width, uint32_t& hei
 
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
             outSample->Release();
-            HandleStreamChange(mft, width, height, subtype, formatEstablished);
+            HandleStreamChange(mft, width, height, yStride, subtype, formatEstablished);
             continue;
         }
 
@@ -299,38 +384,92 @@ static bool DrainDecoderOutput(IMFTransform* mft, uint32_t& width, uint32_t& hei
             break;
         }
 
-        // Extract decoded data
-        IMFMediaBuffer* resultBuf = nullptr;
-        hr = outputBuffer.pSample->ConvertToContiguousBuffer(&resultBuf);
-        if (SUCCEEDED(hr)) {
-            BYTE* data = nullptr;
-            DWORD maxLen = 0, curLen = 0;
-            hr = resultBuf->Lock(&data, &maxLen, &curLen);
-            if (SUCCEEDED(hr)) {
-                if (!formatEstablished) {
-                    HandleStreamChange(mft, width, height, subtype, formatEstablished);
-                }
+        // Extract decoded data — use IMF2DBuffer to get real GPU stride
+        BYTE* data = nullptr;
+        LONG realStride = static_cast<LONG>(width);
+        IMFMediaBuffer* lockedBuf = nullptr;
+        IMF2DBuffer* locked2d = nullptr;
 
-                if (subtype == MFVideoFormat_YV12 || subtype == MFVideoFormat_IYUV) {
-                    Yv12ToBgra(data, width, height, outRGBA);
-                } else if (subtype == MFVideoFormat_YUY2) {
-                    Yuy2ToBgra(data, width, height, outRGBA);
+        // Try IMF2DBuffer first (preserves GPU stride)
+        IMFMediaBuffer* rawBuf = nullptr;
+        if (SUCCEEDED(outputBuffer.pSample->GetBufferByIndex(0, &rawBuf))) {
+            IMF2DBuffer* buf2d = nullptr;
+            if (SUCCEEDED(rawBuf->QueryInterface(IID_PPV_ARGS(&buf2d)))) {
+                hr = buf2d->Lock2D(&data, &realStride);
+                if (SUCCEEDED(hr)) {
+                    lockedBuf = rawBuf;
+                    locked2d = buf2d;
                 } else {
-                    Nv12ToBgra(data, width, height, outRGBA);
+                    buf2d->Release();
+                    rawBuf->Release();
+                    rawBuf = nullptr;
                 }
-                outWidth = width;
-                outHeight = height;
-                gotFrame = true;
-
-                resultBuf->Unlock();
+            } else {
+                rawBuf->Release();
+                rawBuf = nullptr;
             }
-            resultBuf->Release();
+        }
+
+        // Fallback: contiguous buffer
+        if (!locked2d) {
+            hr = outputBuffer.pSample->ConvertToContiguousBuffer(&lockedBuf);
+            if (SUCCEEDED(hr)) {
+                DWORD maxLen = 0, curLen = 0;
+                hr = lockedBuf->Lock(&data, &maxLen, &curLen);
+                if (FAILED(hr)) {
+                    lockedBuf->Release();
+                    lockedBuf = nullptr;
+                }
+            }
+        }
+
+        if (lockedBuf && data) {
+            int32_t actualStride = static_cast<int32_t>(realStride);
+            size_t uvOffset = 0;  // 0 = use default (tightly-packed)
+            uint32_t convWidth = width;
+            uint32_t convHeight = height;
+
+            // When buffer size doesn't match expected, compute real buffer layout.
+            // Content dimensions from media type (SPS) may differ from actual
+            // buffer dimensions due to encoder padding or surface pool sizing.
+            if (!locked2d && subtype == MFVideoFormat_NV12) {
+                DWORD bufLen = 0;
+                lockedBuf->GetCurrentLength(&bufLen);
+                if (ComputeNv12BufferLayout(bufLen, width, height, actualStride, uvOffset)) {
+                    // Clamp content to actual buffer — prevents OOB reads when
+                    // SPS reports larger dimensions than the decoded picture
+                    if (convWidth > static_cast<uint32_t>(actualStride))
+                        convWidth = static_cast<uint32_t>(actualStride);
+                }
+            }
+
+            if (!formatEstablished) {
+                HandleStreamChange(mft, width, height, yStride, subtype, formatEstablished);
+            }
+
+            if (subtype == MFVideoFormat_YV12 || subtype == MFVideoFormat_IYUV) {
+                Yv12ToBgra(data, convWidth, convHeight, actualStride, outRGBA);
+            } else if (subtype == MFVideoFormat_YUY2) {
+                Yuy2ToBgra(data, convWidth, convHeight, actualStride, outRGBA);
+            } else {
+                Nv12ToBgra(data, convWidth, convHeight, actualStride, outRGBA, uvOffset);
+            }
+            outWidth = convWidth;
+            outHeight = convHeight;
+            gotFrame = true;  // keep overwriting — last frame wins
+
+            if (locked2d) {
+                locked2d->Unlock2D();
+                locked2d->Release();
+            } else {
+                lockedBuf->Unlock();
+            }
+            lockedBuf->Release();
+        } else if (locked2d) {
+            locked2d->Release();
         }
 
         outSample->Release();
-
-        // After a stream change, we might get the actual frame immediately after
-        // Skip the status check and continue to get the real output
     }
 
     return gotFrame && !outRGBA.empty();
@@ -341,16 +480,6 @@ bool MfVideoDecoder::DecodeFrame(const uint8_t* bitstream, size_t len,
                                    uint32_t& outWidth, uint32_t& outHeight) {
     if (!m_impl->initialized || !m_impl->mft || len == 0) return false;
     static int failCount = 0;
-    static bool dumpedFirst = false;
-    if (!dumpedFirst && len >= 16) {
-        LOG_INFO("Decoder first input: size=%zu first16: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
-                 len,
-                 bitstream[0], bitstream[1], bitstream[2], bitstream[3],
-                 bitstream[4], bitstream[5], bitstream[6], bitstream[7],
-                 bitstream[8], bitstream[9], bitstream[10], bitstream[11],
-                 bitstream[12], bitstream[13], bitstream[14], bitstream[15]);
-        dumpedFirst = true;
-    }
 
     // Create input sample
     IMFMediaBuffer* mediaBuffer = nullptr;
@@ -387,7 +516,8 @@ bool MfVideoDecoder::DecodeFrame(const uint8_t* bitstream, size_t len,
     if (hr == MF_E_NOTACCEPTING) {
         // Decoder has pending output (likely format change) — drain it first, then retry
         DrainDecoderOutput(m_impl->mft, m_impl->width, m_impl->height,
-                          m_impl->outputSubtype, m_impl->formatEstablished,
+                          m_impl->yStride, m_impl->outputSubtype,
+                          m_impl->formatEstablished,
                           outRGBA, outWidth, outHeight, failCount, len);
 
         // Re-create sample and retry ProcessInput
@@ -418,6 +548,7 @@ bool MfVideoDecoder::DecodeFrame(const uint8_t* bitstream, size_t len,
 
     // Drain output
     return DrainDecoderOutput(m_impl->mft, m_impl->width, m_impl->height,
-                              m_impl->outputSubtype, m_impl->formatEstablished,
+                              m_impl->yStride, m_impl->outputSubtype,
+                              m_impl->formatEstablished,
                               outRGBA, outWidth, outHeight, failCount, len);
 }
