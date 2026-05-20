@@ -27,11 +27,11 @@ struct EncoderManager::Impl {
         int64_t timestampMs = 0;
     };
 
-    ThreadSafeQueue<RawVideoFrame> videoInputQueue{16};
+    ThreadSafeQueue<RawVideoFrame> videoInputQueue{24};
     ThreadSafeQueue<RawAudioFrame> audioInputQueue{16};
 
     // Encoded output queues
-    ThreadSafeQueue<EncodedFrame> videoOutputQueue{32};
+    ThreadSafeQueue<EncodedFrame> videoOutputQueue{48};
     ThreadSafeQueue<EncodedFrame> audioOutputQueue{32};
 
     // Worker threads
@@ -95,7 +95,7 @@ bool EncoderManager::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
     // Start encode workers
     m_impl->videoEncodeThread = std::thread([this]() {
         while (m_impl->running) {
-            auto frame = m_impl->videoInputQueue.tryPop(33);
+            auto frame = m_impl->videoInputQueue.tryPop(5);
             if (frame) {
                 std::vector<uint8_t> bitstream;
                 bool isKeyFrame = false;

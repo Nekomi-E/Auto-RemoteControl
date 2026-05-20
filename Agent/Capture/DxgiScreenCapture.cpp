@@ -392,13 +392,28 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
         return false;
     }
 
-    // Pixel differencing: sample a 64x64 block from the screen center and
-    // compare with the previous frame's sample. The DWM may present frames at
-    // 60fps even when pixel content hasn't changed (V-Sync composition, etc.).
-    // Some GPU drivers report TotalMetadataBufferSize==0 for frames that
-    // actually changed — the sample-diff catches those hidden changes.
-    // Do this BEFORE the TotalMetadataBufferSize fast-path skip.
-    {
+    // Fast path: zero metadata means no dirty/move rects reported by the OS.
+    // The frame is pixel-identical — skip the expensive GPU readback entirely.
+    // On modern drivers (RTX 4080+, WDDM 3.x) this is reliable. For older or
+    // quirky drivers that report TotalMetadataBufferSize==0 on changed frames,
+    // the periodic pixel-diff below acts as a safety net.
+    if (frameInfo.TotalMetadataBufferSize == 0) {
+        static uint32_t tmbZeroLogCount = 0;
+        if ((tmbZeroLogCount++ & 0x3FF) == 0) {
+            LOG_INFO("[CaptureGpu] TotalMetadataBufferSize==0 (count=%u)", tmbZeroLogCount);
+        }
+        srcTexture->Release();
+        mc.duplication->ReleaseFrame();
+        return false;
+    }
+
+    // Periodic pixel differencing: every 8th frame, sample a 64x64 block from
+    // the screen center. This catches false-positive TotalMetadataBufferSize
+    // reports on quirky drivers without incurring a GPU→CPU Map stall on every
+    // captured frame. Map stalls serialize the capture and encode pipelines on
+    // the shared immediate context, halving effective throughput.
+    mc.frameCounter++;
+    if ((mc.frameCounter & 7) == 0) {
         D3D11_TEXTURE2D_DESC srcDesc;
         srcTexture->GetDesc(&srcDesc);
 

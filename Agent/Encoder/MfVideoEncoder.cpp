@@ -954,7 +954,7 @@ bool MfVideoEncoder::EncodeFrame(const uint8_t* rawFrame, uint32_t width, uint32
     }
 
     // Force a keyframe periodically or on request
-    if (m_impl->needKeyFrame || (m_impl->frameIndex % 30 == 0)) {
+    if (m_impl->needKeyFrame || (m_impl->frameIndex % 120 == 0)) {
         RequestKeyFrame();
     }
 
@@ -1437,7 +1437,7 @@ bool MfVideoEncoder::EncodeFrameGpu(ID3D11Texture2D* bgraTexture,
             if (ProcessOutput(outBitstream, outIsKeyFrame)) {
                 m_impl->frameIndex++;
                 if (outIsKeyFrame) m_impl->needKeyFrame = false;
-                if (m_impl->needKeyFrame || (m_impl->frameIndex % 30 == 0))
+                if (m_impl->needKeyFrame || (m_impl->frameIndex % 120 == 0))
                     RequestKeyFrame();
                 return true;
             }

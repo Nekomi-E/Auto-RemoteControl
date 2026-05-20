@@ -35,7 +35,7 @@ private:
     bool AcquireFromMonitor(int index, CapturedFrame& outFrame);
     bool AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFrame);
 
-    static constexpr int kSafePoolSize = 8;
+    static constexpr int kSafePoolSize = 12;
 
     struct MonitorCapture {
         IDXGIOutputDuplication* duplication = nullptr;
@@ -44,6 +44,7 @@ private:
         ID3D11Texture2D* sampleStagingTex = nullptr; // small staging for pixel differencing
         std::vector<uint8_t> prevSample;             // previous frame's sample data
         int duplicateCount = 0;                      // consecutive identical frames
+        uint32_t frameCounter = 0;                   // frames since init, drives periodic pixel diff
         bool valid = false;
 
         // Pre-allocated texture pool to avoid per-frame CreateTexture2D (~16MB)
