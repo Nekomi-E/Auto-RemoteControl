@@ -92,6 +92,9 @@ public:
     void reopen() {
         std::lock_guard lock(m_mutex);
         m_closed = false;
+        // Wake any threads waiting on the queue so they can proceed.
+        m_notEmpty.notify_all();
+        m_notFull.notify_all();
     }
 
 private:

@@ -3,6 +3,7 @@
 #include "Common/Utils/Logger.h"
 #include "Common/Utils/Timer.h"
 #include "Common/Utils/DebugScreenshot.h"
+#include <d3d11.h>
 #include <thread>
 
 AgentSession::AgentSession() {}
@@ -130,8 +131,12 @@ void AgentSession::Stop() {
     m_audioSendQueue.close();
     m_inputQueue.close();
     if (m_network) m_network->Shutdown();
-    if (m_captureMgr) m_captureMgr->Stop();
+    // Stop encoder BEFORE capture manager — the encoder's internal encode
+    // thread uses the D3D11 context that CaptureManager owns. Joining the
+    // encode thread first ensures it has finished all GPU operations before
+    // CaptureManager releases the D3D11 device/context.
     if (m_encoderMgr) m_encoderMgr->Stop();
+    if (m_captureMgr) m_captureMgr->Stop();
 }
 
 void AgentSession::AcceptThread() {
@@ -190,9 +195,18 @@ void AgentSession::CaptureThread() {
                 LOG_INFO("[Capture] First frame (GPU): %ux%u", gpuFrame.width, gpuFrame.height);
             }
             auto now = Timer::NowMs();
-            m_encoderMgr->SubmitVideoFrameGpu(gpuFrame.texture,
+            bool submitted = m_encoderMgr->SubmitVideoFrameGpu(gpuFrame.texture,
                                                gpuFrame.width, gpuFrame.height, now);
             m_captureMgr->ReleaseGpuFrame();
+            if (!submitted) {
+                // Queue full: encoder can't keep up. Release the texture we AddRef'd
+                // in AcquireFrameGpu, otherwise GPU memory leaks and causes crashes.
+                gpuFrame.texture->Release();
+                static uint32_t dropLogCount = 0;
+                if ((dropLogCount++ & 0x3F) == 0) {
+                    LOG_WARNING("[Capture] encoder queue full, dropping GPU frame");
+                }
+            }
             continue;
         }
 
@@ -221,6 +235,9 @@ void AgentSession::CaptureThread() {
             m_encoderMgr->SubmitVideoFrame(std::move(frameData), width, height, Timer::NowMs());
         } else {
             failCount++;
+            // No frame available — yield the CPU to avoid a tight busy-wait
+            // that starves the DWM compositor and reduces capture responsiveness.
+            Sleep(1);
         }
     }
     LOG_INFO("[Capture] Thread stopped, %u frames (%u GPU, %u CPU), %u fails",

@@ -139,16 +139,31 @@ void ViewerSession::Stop() {
 void ViewerSession::RenderFrame() {
     if (!m_running) return;
 
-    // Render video — prefer GPU NV12 path to avoid CPU upload
+    // Snapshot the latest frame under the mutex, then release it so the decode
+    // thread can keep producing frames while we render on the GPU.
+    ID3D11Texture2D* nv12Tex = nullptr;
+    uint32_t nv12W = 0, nv12H = 0;
+    std::vector<uint8_t> cpuFrame;
+
     {
         std::lock_guard lock(m_frameMutex);
         if (m_latestFrame.nv12Texture) {
-            m_renderer->RenderFrameNv12(m_latestFrame.nv12Texture,
-                                         m_latestFrame.width, m_latestFrame.height);
+            nv12Tex = m_latestFrame.nv12Texture;
+            nv12Tex->AddRef();
+            nv12W = m_latestFrame.width;
+            nv12H = m_latestFrame.height;
         } else if (m_latestFrame.width > 0 && !m_latestFrame.data.empty()) {
-            m_renderer->RenderFrame(m_latestFrame.data.data(),
-                                     m_latestFrame.width, m_latestFrame.height);
+            cpuFrame = m_latestFrame.data;
+            nv12W = m_latestFrame.width;
+            nv12H = m_latestFrame.height;
         }
+    }
+
+    if (nv12Tex) {
+        m_renderer->RenderFrameNv12(nv12Tex, nv12W, nv12H);
+        nv12Tex->Release();
+    } else if (!cpuFrame.empty()) {
+        m_renderer->RenderFrame(cpuFrame.data(), nv12W, nv12H);
     }
 
     // Render overlay — show actual decoded video FPS, not network packet rate
@@ -345,7 +360,14 @@ void ViewerSession::NetworkReceiveThread() {
                 vp.data = std::move(packet.data);
                 vp.isKeyFrame = (packet.type == Protocol::FrameType::VIDEO_KEYFRAME);
                 vp.timestampMs = packet.timestampMs;
-                m_videoQueue.tryPush(std::move(vp));
+                // If the queue is full, drop the incoming frame. Log periodically
+                // so we can detect sustained backpressure without spamming logs.
+                if (!m_videoQueue.tryPush(std::move(vp))) {
+                    static uint32_t dropLogCount = 0;
+                    if ((dropLogCount++ & 0x3F) == 0) {
+                        LOG_WARNING("[NetRecv] video queue full, dropping frame");
+                    }
+                }
             } else if (packet.type == Protocol::FrameType::AUDIO_FRAME) {
                 AudioPacket ap;
                 ap.data = std::move(packet.data);
@@ -381,6 +403,14 @@ void ViewerSession::VideoDecodeThread() {
     while (m_running) {
         auto vp = m_videoQueue.tryPop(50);
         if (!vp) continue;
+
+        // Log occasional debug info when packets are being consumed to help
+        // diagnose stalls (coarse sampling to avoid log spam).
+        static uint32_t consumeLogCount = 0;
+        if ((consumeLogCount++ & 0x7F) == 0) {
+            LOG_INFO("[VideoDecode] Consuming packet input size=%zu key=%d queue=%zu",
+                     vp->data.size(), vp->isKeyFrame ? 1 : 0, m_videoQueue.size());
+        }
 
         // Try GPU decode path first — keeps NV12 on GPU, zero CPU readback
         bool decoded = false;
@@ -442,6 +472,9 @@ void ViewerSession::VideoDecodeThread() {
                 }
             } else {
                 fails++;
+                if ((fails & 0x1F) == 0) {
+                    LOG_WARNING("[VideoDecode] consecutive decode failures=%u", fails);
+                }
             }
         }
     }

@@ -117,7 +117,8 @@ bool ViewerNetworkImpl::PerformHandshake() {
     uint8_t lenBuf[4];
     int received = recv(m_tcpSocket, (char*)lenBuf, 4, MSG_WAITALL);
     if (received != 4) {
-        LOG_ERROR("recv AUTH_REQUEST failed: received=%d err=%d", received, WSAGetLastError());
+        int err = WSAGetLastError();
+        LOG_ERROR("recv AUTH_REQUEST len failed: received=%d err=%d", received, err);
         return false;
     }
 
@@ -129,11 +130,20 @@ bool ViewerNetworkImpl::PerformHandshake() {
 
     std::vector<uint8_t> msgBuf(msgLen);
     received = recv(m_tcpSocket, (char*)msgBuf.data(), msgLen, MSG_WAITALL);
-    if (received != static_cast<int>(msgLen)) return false;
+    if (received != static_cast<int>(msgLen)) {
+        int err = WSAGetLastError();
+        LOG_ERROR("recv AUTH_REQUEST body failed: received=%d expected=%zu err=%d", received, msgLen, err);
+        return false;
+    }
 
     auto challengeMsg = Protocol::ControlMessage::deserialize(msgBuf.data(), msgBuf.size());
-    if (!challengeMsg || challengeMsg->type != Protocol::MessageType::AUTH_REQUEST) {
-        LOG_ERROR("Expected AUTH_REQUEST");
+    if (!challengeMsg) {
+        std::string dumped(reinterpret_cast<char*>(msgBuf.data()), msgBuf.size());
+        LOG_ERROR("AUTH_REQUEST deserialize failed, raw='%s'", dumped.c_str());
+        return false;
+    }
+    if (challengeMsg->type != Protocol::MessageType::AUTH_REQUEST) {
+        LOG_ERROR("Unexpected control message type during handshake: %d", (int)challengeMsg->type);
         return false;
     }
 
@@ -155,7 +165,8 @@ bool ViewerNetworkImpl::PerformHandshake() {
         // Receive Agent's public key
         received = recv(m_tcpSocket, (char*)lenBuf, 4, MSG_WAITALL);
         if (received != 4) {
-            LOG_ERROR("recv KEY_EXCHANGE len failed: received=%d err=%d", received, WSAGetLastError());
+            int err = WSAGetLastError();
+            LOG_ERROR("recv KEY_EXCHANGE len failed: received=%d err=%d", received, err);
             return false;
         }
 
@@ -167,15 +178,21 @@ bool ViewerNetworkImpl::PerformHandshake() {
         msgBuf.resize(msgLen);
         received = recv(m_tcpSocket, (char*)msgBuf.data(), msgLen, MSG_WAITALL);
         if (received != static_cast<int>(msgLen)) {
-            LOG_ERROR("recv KEY_EXCHANGE body failed: received=%d err=%d", received, WSAGetLastError());
+            int err = WSAGetLastError();
+            LOG_ERROR("recv KEY_EXCHANGE body failed: received=%d expected=%zu err=%d", received, msgLen, err);
             return false;
         }
 
         auto keyMsg = Protocol::ControlMessage::deserialize(msgBuf.data(), msgBuf.size());
-        if (!keyMsg || keyMsg->type != Protocol::MessageType::KEY_EXCHANGE || !keyMsg->publicKey) {
+        if (!keyMsg) {
+            std::string dumped(reinterpret_cast<char*>(msgBuf.data()), msgBuf.size());
+            LOG_ERROR("KEY_EXCHANGE deserialize failed, raw='%s'", dumped.c_str());
+            return false;
+        }
+        if (keyMsg->type != Protocol::MessageType::KEY_EXCHANGE || !keyMsg->publicKey) {
             LOG_ERROR("Invalid KEY_EXCHANGE: type=%d hasKey=%d",
-                      keyMsg ? (int)keyMsg->type : -1,
-                      keyMsg && keyMsg->publicKey ? 1 : 0);
+                      (int)keyMsg->type,
+                      keyMsg->publicKey ? 1 : 0);
             return false;
         }
 
@@ -231,7 +248,11 @@ bool ViewerNetworkImpl::PerformHandshake() {
 
     // Step 4: Receive session start
     received = recv(m_tcpSocket, (char*)lenBuf, 4, MSG_WAITALL);
-    if (received != 4) return false;
+    if (received != 4) {
+        int err = WSAGetLastError();
+        LOG_ERROR("recv SESSION_START len failed: received=%d err=%d", received, err);
+        return false;
+    }
 
     msgLen = (static_cast<uint32_t>(lenBuf[0]) << 24)
            | (static_cast<uint32_t>(lenBuf[1]) << 16)
@@ -239,10 +260,20 @@ bool ViewerNetworkImpl::PerformHandshake() {
            | lenBuf[3];
     msgBuf.resize(msgLen);
     received = recv(m_tcpSocket, (char*)msgBuf.data(), msgLen, MSG_WAITALL);
+    if (received != static_cast<int>(msgLen)) {
+        int err = WSAGetLastError();
+        LOG_ERROR("recv SESSION_START body failed: received=%d expected=%zu err=%d", received, msgLen, err);
+        return false;
+    }
 
     auto startMsg = Protocol::ControlMessage::deserialize(msgBuf.data(), msgBuf.size());
-    if (!startMsg || startMsg->type != Protocol::MessageType::SESSION_START) {
-        LOG_ERROR("Expected SESSION_START");
+    if (!startMsg) {
+        std::string dumped(reinterpret_cast<char*>(msgBuf.data()), msgBuf.size());
+        LOG_ERROR("SESSION_START deserialize failed, raw='%s'", dumped.c_str());
+        return false;
+    }
+    if (startMsg->type != Protocol::MessageType::SESSION_START) {
+        LOG_ERROR("Unexpected control message type at SESSION_START: %d", (int)startMsg->type);
         return false;
     }
 
