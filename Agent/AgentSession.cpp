@@ -66,7 +66,7 @@ bool AgentSession::Initialize(const AgentConfig& config) {
     uint32_t encHeight = monitors[0].height;
     if (!m_encoderMgr->Initialize(encWidth, encHeight,
                                    m_config.videoBitrate, m_config.targetFps,
-                                   m_config.enableAudio,
+                                   m_config.enableAudio, m_config.videoQuality,
                                    m_captureMgr->GetD3DDevice(),
                                    m_captureMgr->GetD3DContext())) {
         LOG_ERROR("Failed to initialize encoders");
@@ -171,7 +171,7 @@ void AgentSession::AcceptThread() {
 
 void AgentSession::CaptureThread() {
     LOG_INFO("[Capture] Thread started");
-    uint32_t frameCount = 0, failCount = 0;
+    uint32_t frameCount = 0, failCount = 0, gpuCount = 0;
     int64_t lastDebugSaveMs = 0;
     uint32_t debugSaveCount = 0;
 
@@ -181,21 +181,36 @@ void AgentSession::CaptureThread() {
             continue;
         }
 
+        // Try GPU capture path first (zero CPU readback)
+        CapturedFrameGpu gpuFrame;
+        if (m_captureMgr->AcquireFrameGpu(gpuFrame)) {
+            frameCount++;
+            gpuCount++;
+            if (frameCount == 1) {
+                LOG_INFO("[Capture] First frame (GPU): %ux%u", gpuFrame.width, gpuFrame.height);
+            }
+            auto now = Timer::NowMs();
+            m_encoderMgr->SubmitVideoFrameGpu(gpuFrame.texture,
+                                               gpuFrame.width, gpuFrame.height, now);
+            m_captureMgr->ReleaseGpuFrame();
+            continue;
+        }
+
+        // CPU fallback: read back from GPU and submit raw BGRA bytes
         uint32_t width, height;
         std::vector<uint8_t> frameData;
         if (m_captureMgr->AcquireFrame(frameData, width, height)) {
             frameCount++;
             if (frameCount == 1) {
-                LOG_INFO("[Capture] First frame captured: %ux%u", width, height);
+                LOG_INFO("[Capture] First frame captured (CPU): %ux%u", width, height);
             }
 
             // DEBUG: Save raw capture to BMP every ~5 seconds (up to 10)
-            // Run on a background thread so disk I/O doesn't stall the capture pipeline
             auto now = Timer::NowMs();
             if (debugSaveCount < 10 && (debugSaveCount == 0 || now - lastDebugSaveMs >= 5000)) {
                 lastDebugSaveMs = now;
                 debugSaveCount++;
-                std::vector<uint8_t> copyForSave = frameData; // deep copy before we move()
+                std::vector<uint8_t> copyForSave = frameData;
                 std::thread([](std::vector<uint8_t> data, uint32_t w, uint32_t h, uint32_t cnt) {
                     char prefix[64];
                     snprintf(prefix, sizeof(prefix), "agent_capture_%u", cnt);
@@ -208,7 +223,8 @@ void AgentSession::CaptureThread() {
             failCount++;
         }
     }
-    LOG_INFO("[Capture] Thread stopped, %u frames captured, %u fails", frameCount, failCount);
+    LOG_INFO("[Capture] Thread stopped, %u frames (%u GPU, %u CPU), %u fails",
+             frameCount, gpuCount, frameCount - gpuCount, failCount);
 }
 
 void AgentSession::VideoEncodeThread() {

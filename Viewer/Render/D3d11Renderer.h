@@ -27,6 +27,7 @@ public:
     void Resize(uint32_t width, uint32_t height);
 
     void RenderFrame(const uint8_t* rgbaData, uint32_t width, uint32_t height);
+    void RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width, uint32_t height);
     void Present();
 
     ID2D1DeviceContext* GetD2DDeviceContext() const { return m_d2dContext; }
@@ -54,8 +55,18 @@ private:
     // Fullscreen quad
     ID3D11Buffer* m_quadVB = nullptr;
     ID3D11VertexShader* m_vertexShader = nullptr;
-    ID3D11PixelShader* m_pixelShader = nullptr;
+    ID3D11PixelShader* m_pixelShader = nullptr;        // BGRA sampler
+    ID3D11PixelShader* m_pixelShaderNv12 = nullptr;    // NV12→BGRA converter
     ID3D11InputLayout* m_inputLayout = nullptr;
+
+    // Cached NV12 copy texture + SRVs for GPU decode path.
+    // Incoming MFT textures may lack D3D11_BIND_SHADER_RESOURCE,
+    // so we CopyResource into our own texture and create SRVs once.
+    ID3D11Texture2D* m_nv12CopyTex = nullptr;
+    ID3D11ShaderResourceView* m_nv12CopySRV_Y = nullptr;
+    ID3D11ShaderResourceView* m_nv12CopySRV_UV = nullptr;
+    uint32_t m_nv12CopyWidth = 0;
+    uint32_t m_nv12CopyHeight = 0;
 
     uint32_t m_textureWidth = 0;
     uint32_t m_textureHeight = 0;

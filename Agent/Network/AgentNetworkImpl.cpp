@@ -313,27 +313,26 @@ bool AgentNetworkImpl::SendDataFrame(Protocol::FrameType type, uint16_t seq,
 
         const uint8_t* sendPayload = payload;
         size_t sendPayloadSize = payloadSize;
-        std::vector<uint8_t> encrypted;
 
         if (m_encrypted && m_secureChannel) {
             header.setEncrypted(true);
-            encrypted = m_secureChannel->EncryptFrame(header, payload, payloadSize);
-            if (encrypted.empty()) return false;
-            sendPayload = encrypted.data();
-            sendPayloadSize = encrypted.size();
+            if (!m_secureChannel->EncryptFrameOut(header, payload, payloadSize, m_encryptBuffer))
+                return false;
+            sendPayload = m_encryptBuffer.data();
+            sendPayloadSize = m_encryptBuffer.size();
         }
 
         auto headerBytes = header.serialize();
-        std::vector<uint8_t> packet;
-        packet.reserve(headerBytes.size() + sendPayloadSize);
-        packet.insert(packet.end(), headerBytes.begin(), headerBytes.end());
-        packet.insert(packet.end(), sendPayload, sendPayload + sendPayloadSize);
+        m_sendBuffer.clear();
+        m_sendBuffer.reserve(headerBytes.size() + sendPayloadSize);
+        m_sendBuffer.insert(m_sendBuffer.end(), headerBytes.begin(), headerBytes.end());
+        m_sendBuffer.insert(m_sendBuffer.end(), sendPayload, sendPayload + sendPayloadSize);
 
-        int sent = sendto(m_udpSocket, (const char*)packet.data(), (int)packet.size(), 0,
+        int sent = sendto(m_udpSocket, (const char*)m_sendBuffer.data(), (int)m_sendBuffer.size(), 0,
                           (const sockaddr*)&m_udpDestAddr, sizeof(m_udpDestAddr));
-        if (sent != static_cast<int>(packet.size())) {
+        if (sent != static_cast<int>(m_sendBuffer.size())) {
             LOG_ERROR("[SendDataFrame] sendto failed: sent=%d expected=%zu err=%d",
-                      sent, packet.size(), WSAGetLastError());
+                      sent, m_sendBuffer.size(), WSAGetLastError());
             return false;
         }
         return true;
@@ -349,13 +348,16 @@ bool AgentNetworkImpl::SendDataFrame(Protocol::FrameType type, uint16_t seq,
         loggedOnce = true;
     }
 
+    // Pre-allocate fragment prefix buffer for reuse
+    std::vector<uint8_t> fragPrefix;
+    fragPrefix.reserve(Protocol::FragmentHeader::WireSize + MAX_FRAG_DATA);
+
     for (uint16_t i = 0; i < totalFrags; i++) {
         size_t offset = static_cast<size_t>(i) * MAX_FRAG_DATA;
         size_t chunkSize = (offset + MAX_FRAG_DATA <= payloadSize) ? MAX_FRAG_DATA : (payloadSize - offset);
 
         // Build fragment prefix: FragmentHeader (6 bytes) + chunk data
-        // This combined prefix becomes the "payload" that gets encrypted
-        std::vector<uint8_t> fragPrefix(Protocol::FragmentHeader::WireSize + chunkSize);
+        fragPrefix.resize(Protocol::FragmentHeader::WireSize + chunkSize);
         fragPrefix[0] = static_cast<uint8_t>((fragId >> 8) & 0xFF);
         fragPrefix[1] = static_cast<uint8_t>(fragId & 0xFF);
         fragPrefix[2] = static_cast<uint8_t>((i >> 8) & 0xFF);
@@ -376,28 +378,28 @@ bool AgentNetworkImpl::SendDataFrame(Protocol::FrameType type, uint16_t seq,
         // Encrypt the FragmentHeader + chunk as one unit
         const uint8_t* sendPayload = fragPrefix.data();
         size_t sendPayloadSize = fragPrefix.size();
-        std::vector<uint8_t> encrypted;
 
         if (m_encrypted && m_secureChannel) {
             fragFrameHdr.setEncrypted(true);
-            encrypted = m_secureChannel->EncryptFrame(fragFrameHdr, fragPrefix.data(), fragPrefix.size());
-            if (encrypted.empty()) return false;
-            sendPayload = encrypted.data();
-            sendPayloadSize = encrypted.size();
+            if (!m_secureChannel->EncryptFrameOut(fragFrameHdr, fragPrefix.data(), fragPrefix.size(),
+                                                    m_encryptBuffer))
+                return false;
+            sendPayload = m_encryptBuffer.data();
+            sendPayloadSize = m_encryptBuffer.size();
         }
 
         // Serialize FrameHeader + encrypted(FragmentHeader + chunk)
         auto fragHdrBytes = fragFrameHdr.serialize();
-        std::vector<uint8_t> packet;
-        packet.reserve(fragHdrBytes.size() + sendPayloadSize);
-        packet.insert(packet.end(), fragHdrBytes.begin(), fragHdrBytes.end());
-        packet.insert(packet.end(), sendPayload, sendPayload + sendPayloadSize);
+        m_sendBuffer.clear();
+        m_sendBuffer.reserve(fragHdrBytes.size() + sendPayloadSize);
+        m_sendBuffer.insert(m_sendBuffer.end(), fragHdrBytes.begin(), fragHdrBytes.end());
+        m_sendBuffer.insert(m_sendBuffer.end(), sendPayload, sendPayload + sendPayloadSize);
 
-        int sent = sendto(m_udpSocket, (const char*)packet.data(), (int)packet.size(), 0,
+        int sent = sendto(m_udpSocket, (const char*)m_sendBuffer.data(), (int)m_sendBuffer.size(), 0,
                           (const sockaddr*)&m_udpDestAddr, sizeof(m_udpDestAddr));
-        if (sent != static_cast<int>(packet.size())) {
+        if (sent != static_cast<int>(m_sendBuffer.size())) {
             LOG_ERROR("[SendDataFrame] Fragment %u/%u sendto failed: sent=%d expected=%zu err=%d",
-                      i + 1, totalFrags, sent, packet.size(), WSAGetLastError());
+                      i + 1, totalFrags, sent, m_sendBuffer.size(), WSAGetLastError());
             return false;
         }
     }

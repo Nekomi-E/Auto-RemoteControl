@@ -8,12 +8,14 @@
 #include <mferror.h>
 #include <codecapi.h>
 #include <wmcodecdsp.h>
+#include <d3d11.h>
 #include <cstring>
 #include <thread>
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "d3d11.lib")
 
 struct MfVideoDecoder::Impl {
     IMFTransform* mft = nullptr;
@@ -27,6 +29,16 @@ struct MfVideoDecoder::Impl {
     GUID outputSubtype = GUID_NULL;
     GUID inputSubtype = GUID_NULL;
     int64_t sampleTime = 0;
+
+    // D3D11 interop for GPU decode path
+    ID3D11Device* d3dDevice = nullptr;
+    ID3D11DeviceContext* d3dContext = nullptr;
+    IMFDXGIDeviceManager* deviceManager = nullptr;
+    UINT deviceResetToken = 0;
+    bool gpuDecodeAvailable = false;
+
+    // Track stream changes so callers can re-feed after format negotiation
+    uint32_t streamChangeCount = 0;
 };
 
 MfVideoDecoder::MfVideoDecoder() : m_impl(std::make_unique<Impl>()) {}
@@ -143,13 +155,88 @@ bool MfVideoDecoder::Initialize(uint32_t codecType, uint32_t width, uint32_t hei
     return true;
 }
 
+bool MfVideoDecoder::InitializeWithD3D11(uint32_t codecType, uint32_t width, uint32_t height,
+                                          ID3D11Device* device, ID3D11DeviceContext* context) {
+    LOG_INFO("InitializeWithD3D11 called: initialized=%d device=%p context=%p mft=%p",
+             m_impl->initialized ? 1 : 0, (void*)device, (void*)context, (void*)m_impl->mft);
+
+    // Only initialize if not already done (caller may have called Initialize first)
+    if (!m_impl->initialized) {
+        if (!Initialize(codecType, width, height))
+            return false;
+    }
+
+    if (!device || !context || !m_impl->mft) {
+        LOG_INFO("D3D11 interop skipped: device=%p context=%p mft=%p",
+                 (void*)device, (void*)context, (void*)m_impl->mft);
+        return true; // fall back to CPU — already initialized
+    }
+
+    // Check if the activated MFT is D3D11-aware
+    IMFAttributes* attrs = nullptr;
+    UINT32 d3dAware = 0;
+    bool canUseGpu = false;
+    if (SUCCEEDED(m_impl->mft->GetAttributes(&attrs))) {
+        if (SUCCEEDED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &d3dAware)) && d3dAware != 0) {
+            canUseGpu = true;
+        }
+        attrs->Release();
+    }
+
+    if (!canUseGpu) {
+        LOG_INFO("Decoder is not D3D11-aware, using CPU decode path");
+        return true;
+    }
+
+    // Create device manager and reset with the viewer's D3D11 device
+    UINT token = 0;
+    IMFDXGIDeviceManager* dm = nullptr;
+    if (FAILED(MFCreateDXGIDeviceManager(&token, &dm))) {
+        LOG_INFO("Failed to create device manager for decoder, using CPU path");
+        return true;
+    }
+
+    if (FAILED(dm->ResetDevice(device, token))) {
+        dm->Release();
+        LOG_INFO("Failed to reset device manager for decoder, using CPU path");
+        return true;
+    }
+
+    // Send D3D manager to decoder
+    HRESULT hr = m_impl->mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)dm);
+    if (FAILED(hr)) {
+        dm->Release();
+        LOG_INFO("Decoder rejected D3D11 device manager (hr=0x%08X), using CPU path", hr);
+        return true;
+    }
+
+    m_impl->d3dDevice = device;
+    m_impl->d3dContext = context;
+    m_impl->deviceManager = dm;
+    m_impl->deviceResetToken = token;
+    m_impl->gpuDecodeAvailable = true;
+    LOG_INFO("D3D11 device manager set on decoder — GPU decode path available");
+    return true;
+}
+
+bool MfVideoDecoder::HasGpuPath() const {
+    return m_impl->gpuDecodeAvailable;
+}
+
 void MfVideoDecoder::Shutdown() {
     if (m_impl->mft) m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
     m_impl->initialized = false;
+    m_impl->gpuDecodeAvailable = false;
     if (m_impl->mft) m_impl->mft->Release();
     if (m_impl->inputType) m_impl->inputType->Release();
     if (m_impl->outputType) m_impl->outputType->Release();
+    if (m_impl->deviceManager) m_impl->deviceManager->Release();
     m_impl->mft = nullptr;
+    m_impl->inputType = nullptr;
+    m_impl->outputType = nullptr;
+    m_impl->deviceManager = nullptr;
+    m_impl->d3dDevice = nullptr;
+    m_impl->d3dContext = nullptr;
 }
 
 // NV12: Y plane (stride=yStride), then interleaved UV plane (same stride).
@@ -344,6 +431,14 @@ static bool HandleStreamChange(IMFTransform* mft, uint32_t& width, uint32_t& hei
     formatEstablished = true;
     LOG_INFO("Decoder stream change: %ux%u stride=%d subtype=%08X",
              w, h, yStride, subtype.Data1);
+
+    // Acknowledge the new type — required by MFT contract after stream change.
+    // Without this, subsequent ProcessInput calls may fail or produce no output.
+    HRESULT setHr = mft->SetOutputType(0, newType, 0);
+    if (FAILED(setHr)) {
+        LOG_WARNING("SetOutputType after stream change failed: 0x%08X", setHr);
+    }
+
     newType->Release();
     return true;
 }
@@ -420,52 +515,64 @@ static bool ComputeNv12BufferLayout(DWORD bufLen, uint32_t contentWidth, uint32_
 // Drains ALL available frames and returns the last one (most recent PTS),
 // which avoids showing stale DPB frames that cause black flashing.
 // Returns true if at least one frame was decoded.
+// outStreamChanged is set to true when a format change occurs; caller should
+// re-feed the same input and call this function again.
 static bool DrainDecoderOutput(IMFTransform* mft, uint32_t& width, uint32_t& height,
                                 int32_t& yStride, GUID& subtype, bool& formatEstablished,
                                 std::vector<uint8_t>& outRGBA,
                                 uint32_t& outWidth, uint32_t& outHeight,
-                                int& failCount, size_t inputLen) {
+                                int& failCount, size_t inputLen,
+                                bool& outStreamChanged) {
+    outStreamChanged = false;
     bool gotFrame = false;
     MFT_OUTPUT_STREAM_INFO streamInfo = {};
     HRESULT hr = mft->GetOutputStreamInfo(0, &streamInfo);
     if (FAILED(hr)) return false;
 
+    bool mftProvidesSamples = (streamInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
     DWORD baseBufSize = streamInfo.cbSize ? streamInfo.cbSize : 1920 * 1080 * 3 / 2;
 
     for (;;) {
         MFT_OUTPUT_DATA_BUFFER outputBuffer = {};
-
-        IMFMediaBuffer* outBuf = nullptr;
-        hr = MFCreateMemoryBuffer(baseBufSize, &outBuf);
-        if (FAILED(hr)) break;
-
         IMFSample* outSample = nullptr;
-        hr = MFCreateSample(&outSample);
-        if (FAILED(hr)) {
+
+        if (mftProvidesSamples) {
+            // D3D11-aware MFT allocates its own output samples (GPU-backed)
+            outputBuffer.pSample = nullptr;
+        } else {
+            // Software MFT: client provides output buffer
+            IMFMediaBuffer* outBuf = nullptr;
+            hr = MFCreateMemoryBuffer(baseBufSize, &outBuf);
+            if (FAILED(hr)) break;
+            hr = MFCreateSample(&outSample);
+            if (FAILED(hr)) { outBuf->Release(); break; }
+            outSample->AddBuffer(outBuf);
             outBuf->Release();
-            break;
+            outputBuffer.pSample = outSample;
         }
-        outSample->AddBuffer(outBuf);
-        outBuf->Release();
-        outputBuffer.pSample = outSample;
         outputBuffer.dwStreamID = 0;
 
         DWORD status = 0;
         hr = mft->ProcessOutput(0, 1, &outputBuffer, &status);
 
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            outSample->Release();
+            if (outSample) outSample->Release();
+            else if (outputBuffer.pSample) outputBuffer.pSample->Release();
             break;
         }
 
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-            outSample->Release();
+            if (outSample) outSample->Release();
+            else if (outputBuffer.pSample) outputBuffer.pSample->Release();
             HandleStreamChange(mft, width, height, yStride, subtype, formatEstablished);
+            outStreamChanged = true;
+            LOG_INFO("Drain: stream change handled, continuing drain loop");
             continue;
         }
 
         if (FAILED(hr)) {
-            outSample->Release();
+            if (outSample) outSample->Release();
+            else if (outputBuffer.pSample) outputBuffer.pSample->Release();
             if (failCount < 5) {
                 LOG_WARNING("Decoder ProcessOutput failed: 0x%08X status=%u (input=%zu bytes)",
                             hr, status, inputLen);
@@ -473,6 +580,10 @@ static bool DrainDecoderOutput(IMFTransform* mft, uint32_t& width, uint32_t& hei
             }
             break;
         }
+
+        // If MFT provided the sample, use it
+        if (!outSample) outSample = outputBuffer.pSample;
+        LOG_INFO("Drain: got frame from ProcessOutput");
 
         // Extract decoded data — use IMF2DBuffer to get real GPU stride
         BYTE* data = nullptr;
@@ -557,6 +668,13 @@ static bool DrainDecoderOutput(IMFTransform* mft, uint32_t& width, uint32_t& hei
             lockedBuf->Release();
         } else if (locked2d) {
             locked2d->Release();
+        } else {
+            static int lockFailCount = 0;
+            if (lockFailCount < 3) {
+                LOG_WARNING("Drain: could not lock output buffer (mftProvidesSamples=%d)",
+                            mftProvidesSamples ? 1 : 0);
+                lockFailCount++;
+            }
         }
 
         outSample->Release();
@@ -605,10 +723,12 @@ bool MfVideoDecoder::DecodeFrame(const uint8_t* bitstream, size_t len,
 
     if (hr == MF_E_NOTACCEPTING) {
         // Decoder has pending output (likely format change) — drain it first, then retry
+        bool streamChanged = false;
         DrainDecoderOutput(m_impl->mft, m_impl->width, m_impl->height,
                           m_impl->yStride, m_impl->outputSubtype,
                           m_impl->formatEstablished,
-                          outRGBA, outWidth, outHeight, failCount, len);
+                          outRGBA, outWidth, outHeight, failCount, len,
+                          streamChanged);
 
         // Re-create sample and retry ProcessInput
         hr = MFCreateMemoryBuffer(static_cast<DWORD>(len), &mediaBuffer);
@@ -636,9 +756,269 @@ bool MfVideoDecoder::DecodeFrame(const uint8_t* bitstream, size_t len,
         return false;
     }
 
-    // Drain output
-    return DrainDecoderOutput(m_impl->mft, m_impl->width, m_impl->height,
+    // Drain output — re-feed if the decoder signalled a stream change
+    // (the input that triggered the format negotiation is consumed by the MFT
+    // and must be resubmitted to produce the first decoded frame).
+    bool streamChanged = false;
+    bool gotFrame = DrainDecoderOutput(m_impl->mft, m_impl->width, m_impl->height,
+                                       m_impl->yStride, m_impl->outputSubtype,
+                                       m_impl->formatEstablished,
+                                       outRGBA, outWidth, outHeight, failCount, len,
+                                       streamChanged);
+
+    if (!gotFrame && streamChanged) {
+        LOG_INFO("Re-feeding after stream change: %zu bytes", len);
+        // Re-feed the same bitstream — the format change consumed the input
+        hr = MFCreateMemoryBuffer(static_cast<DWORD>(len), &mediaBuffer);
+        if (SUCCEEDED(hr)) {
+            hr = mediaBuffer->Lock(&bufferData, nullptr, nullptr);
+            if (SUCCEEDED(hr)) {
+                memcpy(bufferData, bitstream, len);
+                mediaBuffer->Unlock();
+                mediaBuffer->SetCurrentLength(static_cast<DWORD>(len));
+                hr = MFCreateSample(&sample);
+                if (SUCCEEDED(hr)) {
+                    sample->AddBuffer(mediaBuffer);
+                    mediaBuffer->Release();
+                    sample->SetSampleTime(m_impl->sampleTime);
+                    sample->SetSampleDuration(166667);
+                    hr = m_impl->mft->ProcessInput(0, sample, 0);
+                    sample->Release();
+                    if (SUCCEEDED(hr)) {
+                        bool ignored = false;
+                        gotFrame = DrainDecoderOutput(m_impl->mft, m_impl->width, m_impl->height,
+                                                      m_impl->yStride, m_impl->outputSubtype,
+                                                      m_impl->formatEstablished,
+                                                      outRGBA, outWidth, outHeight, failCount, len,
+                                                      ignored);
+                        LOG_INFO("Re-feed drain result: gotFrame=%d", gotFrame ? 1 : 0);
+                    } else {
+                        LOG_WARNING("Re-feed ProcessInput failed: 0x%08X", hr);
+                    }
+                } else {
+                    mediaBuffer->Release();
+                }
+            } else {
+                mediaBuffer->Release();
+            }
+        }
+    }
+
+    return gotFrame;
+}
+
+// GPU-aware drain: extracts ID3D11Texture2D from decoder output if GPU-backed.
+// Falls back to CPU readback if the output is not a DXGI surface.
+static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& height,
+                                   int32_t& yStride, GUID& subtype, bool& formatEstablished,
+                                   ID3D11Device* d3dDevice,
+                                   ID3D11Texture2D*& outNv12Texture,
+                                   uint32_t& outWidth, uint32_t& outHeight,
+                                   int& failCount, size_t inputLen,
+                                   bool& outStreamChanged) {
+    outStreamChanged = false;
+    outNv12Texture = nullptr;
+    MFT_OUTPUT_STREAM_INFO streamInfo = {};
+    HRESULT hr = mft->GetOutputStreamInfo(0, &streamInfo);
+    if (FAILED(hr)) return false;
+
+    bool mftProvidesSamples = (streamInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
+    DWORD baseBufSize = streamInfo.cbSize ? streamInfo.cbSize : 1920 * 1080 * 3 / 2;
+
+    for (;;) {
+        MFT_OUTPUT_DATA_BUFFER outputBuffer = {};
+        IMFSample* outSample = nullptr;
+
+        if (mftProvidesSamples) {
+            // D3D11-aware MFT allocates its own output samples (GPU-backed)
+            outputBuffer.pSample = nullptr;
+        } else {
+            IMFMediaBuffer* outBuf = nullptr;
+            hr = MFCreateMemoryBuffer(baseBufSize, &outBuf);
+            if (FAILED(hr)) break;
+            hr = MFCreateSample(&outSample);
+            if (FAILED(hr)) { outBuf->Release(); break; }
+            outSample->AddBuffer(outBuf);
+            outBuf->Release();
+            outputBuffer.pSample = outSample;
+        }
+        outputBuffer.dwStreamID = 0;
+
+        DWORD status = 0;
+        hr = mft->ProcessOutput(0, 1, &outputBuffer, &status);
+
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            if (outSample) outSample->Release();
+            else if (outputBuffer.pSample) outputBuffer.pSample->Release();
+            break;
+        }
+
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+            if (outSample) outSample->Release();
+            else if (outputBuffer.pSample) outputBuffer.pSample->Release();
+            HandleStreamChange(mft, width, height, yStride, subtype, formatEstablished);
+            outStreamChanged = true;
+            continue;
+        }
+
+        if (FAILED(hr)) {
+            if (outSample) outSample->Release();
+            else if (outputBuffer.pSample) outputBuffer.pSample->Release();
+            if (failCount < 5) {
+                LOG_WARNING("Decoder ProcessOutput failed (GPU): 0x%08X status=%u", hr, status);
+                failCount++;
+            }
+            break;
+        }
+
+        // If MFT provided the sample, use it
+        if (!outSample) outSample = outputBuffer.pSample;
+
+        // Try to extract the GPU texture from the output buffer
+        IMFMediaBuffer* buf = nullptr;
+        if (SUCCEEDED(outputBuffer.pSample->GetBufferByIndex(0, &buf))) {
+            // Check if this buffer wraps a DXGI surface (GPU-backed)
+            IMFDXGIBuffer* dxgiBuf = nullptr;
+            if (SUCCEEDED(buf->QueryInterface(IID_PPV_ARGS(&dxgiBuf)))) {
+                ID3D11Texture2D* tex = nullptr;
+                if (SUCCEEDED(dxgiBuf->GetResource(__uuidof(ID3D11Texture2D), (void**)&tex)) && tex) {
+                    // Release previous texture (drain loop returns last frame)
+                    if (outNv12Texture) outNv12Texture->Release();
+                    outNv12Texture = tex; // already AddRef'd by GetResource
+                    outWidth = width;
+                    outHeight = height;
+                    if (!formatEstablished) {
+                        HandleStreamChange(mft, width, height, yStride, subtype, formatEstablished);
+                    }
+                    dxgiBuf->Release();
+                    buf->Release();
+                    outSample->Release();
+                    continue; // drain remaining frames
+                }
+                dxgiBuf->Release();
+            }
+            buf->Release();
+        }
+
+        outSample->Release();
+    }
+
+    return outNv12Texture != nullptr;
+}
+
+bool MfVideoDecoder::DecodeFrameGpu(const uint8_t* bitstream, size_t len,
+                                     ID3D11Texture2D*& outNv12Texture,
+                                     uint32_t& outWidth, uint32_t& outHeight) {
+    if (!m_impl->initialized || !m_impl->mft || len == 0) return false;
+    if (!m_impl->gpuDecodeAvailable) return false;
+    static int failCount = 0;
+
+    // Create input sample
+    IMFMediaBuffer* mediaBuffer = nullptr;
+    HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(len), &mediaBuffer);
+    if (FAILED(hr)) return false;
+
+    BYTE* bufferData = nullptr;
+    hr = mediaBuffer->Lock(&bufferData, nullptr, nullptr);
+    if (FAILED(hr)) { mediaBuffer->Release(); return false; }
+    memcpy(bufferData, bitstream, len);
+    mediaBuffer->Unlock();
+    mediaBuffer->SetCurrentLength(static_cast<DWORD>(len));
+
+    IMFSample* sample = nullptr;
+    hr = MFCreateSample(&sample);
+    if (FAILED(hr)) { mediaBuffer->Release(); return false; }
+    sample->AddBuffer(mediaBuffer);
+    mediaBuffer->Release();
+
+    sample->SetSampleTime(m_impl->sampleTime);
+    sample->SetSampleDuration(166667);
+    m_impl->sampleTime += 166667;
+
+    hr = m_impl->mft->ProcessInput(0, sample, 0);
+    sample->Release();
+
+    if (hr == MF_E_NOTACCEPTING) {
+        // Drain pending output first, then retry
+        bool streamChanged = false;
+        DrainDecoderOutputGpu(m_impl->mft, m_impl->width, m_impl->height,
                               m_impl->yStride, m_impl->outputSubtype,
                               m_impl->formatEstablished,
-                              outRGBA, outWidth, outHeight, failCount, len);
+                              m_impl->d3dDevice,
+                              outNv12Texture, outWidth, outHeight, failCount, len,
+                              streamChanged);
+
+        hr = MFCreateMemoryBuffer(static_cast<DWORD>(len), &mediaBuffer);
+        if (FAILED(hr)) return false;
+        hr = mediaBuffer->Lock(&bufferData, nullptr, nullptr);
+        if (FAILED(hr)) { mediaBuffer->Release(); return false; }
+        memcpy(bufferData, bitstream, len);
+        mediaBuffer->Unlock();
+        mediaBuffer->SetCurrentLength(static_cast<DWORD>(len));
+        hr = MFCreateSample(&sample);
+        if (FAILED(hr)) { mediaBuffer->Release(); return false; }
+        sample->AddBuffer(mediaBuffer);
+        mediaBuffer->Release();
+        sample->SetSampleTime(m_impl->sampleTime);
+        sample->SetSampleDuration(166667);
+        hr = m_impl->mft->ProcessInput(0, sample, 0);
+        sample->Release();
+    }
+
+    if (FAILED(hr)) {
+        if (failCount < 5) {
+            LOG_WARNING("Decoder ProcessInput failed (GPU): 0x%08X", hr);
+            failCount++;
+        }
+        return false;
+    }
+
+    bool streamChanged = false;
+    bool gotFrame = DrainDecoderOutputGpu(m_impl->mft, m_impl->width, m_impl->height,
+                                          m_impl->yStride, m_impl->outputSubtype,
+                                          m_impl->formatEstablished,
+                                          m_impl->d3dDevice,
+                                          outNv12Texture, outWidth, outHeight, failCount, len,
+                                          streamChanged);
+
+    if (!gotFrame && streamChanged) {
+        LOG_INFO("Re-feeding (GPU) after stream change: %zu bytes", len);
+        // Re-feed the same bitstream — the format change consumed the input
+        hr = MFCreateMemoryBuffer(static_cast<DWORD>(len), &mediaBuffer);
+        if (SUCCEEDED(hr)) {
+            hr = mediaBuffer->Lock(&bufferData, nullptr, nullptr);
+            if (SUCCEEDED(hr)) {
+                memcpy(bufferData, bitstream, len);
+                mediaBuffer->Unlock();
+                mediaBuffer->SetCurrentLength(static_cast<DWORD>(len));
+                hr = MFCreateSample(&sample);
+                if (SUCCEEDED(hr)) {
+                    sample->AddBuffer(mediaBuffer);
+                    mediaBuffer->Release();
+                    sample->SetSampleTime(m_impl->sampleTime);
+                    sample->SetSampleDuration(166667);
+                    hr = m_impl->mft->ProcessInput(0, sample, 0);
+                    sample->Release();
+                    if (SUCCEEDED(hr)) {
+                        bool ignored = false;
+                        gotFrame = DrainDecoderOutputGpu(m_impl->mft, m_impl->width, m_impl->height,
+                                                         m_impl->yStride, m_impl->outputSubtype,
+                                                         m_impl->formatEstablished,
+                                                         m_impl->d3dDevice,
+                                                         outNv12Texture, outWidth, outHeight,
+                                                         failCount, len, ignored);
+                        LOG_INFO("Re-feed drain (GPU) result: gotFrame=%d", gotFrame ? 1 : 0);
+                    } else {
+                        LOG_WARNING("Re-feed ProcessInput (GPU) failed: 0x%08X", hr);
+                    }
+                } else {
+                    mediaBuffer->Release();
+                }
+            } else {
+                mediaBuffer->Release();
+            }
+        }
+    }
+
+    return gotFrame;
 }

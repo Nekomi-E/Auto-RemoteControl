@@ -20,6 +20,11 @@ public:
     std::vector<uint8_t> EncryptFrame(const Protocol::FrameHeader& header,
                                        const uint8_t* payload, size_t payloadLen);
 
+    // Fill outWireData instead of returning a new vector (avoids per-frame allocation).
+    bool EncryptFrameOut(const Protocol::FrameHeader& header,
+                         const uint8_t* payload, size_t payloadLen,
+                         std::vector<uint8_t>& outWireData);
+
     // Decrypt a frame from wire format.
     // Input: data from network (IV + ciphertext + tag)
     // header: parsed FrameHeader used as AAD
@@ -32,6 +37,7 @@ public:
 
 private:
     AesGcm m_aes;
+    std::vector<uint8_t> m_iv;      // reusable IV buffer (12 bytes)
     std::atomic<uint64_t> m_encryptedCount{0};
     std::atomic<uint64_t> m_decryptedCount{0};
     std::atomic<uint64_t> m_authFailCount{0};

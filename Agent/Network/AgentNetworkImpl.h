@@ -57,6 +57,10 @@ private:
     std::atomic<bool> m_encrypted{false};
     std::mutex m_sendMutex; // TCP send serialization
 
+    // Pre-allocated buffers to avoid per-frame heap allocations
+    std::vector<uint8_t> m_sendBuffer;     // UDP packet assembly buffer
+    std::vector<uint8_t> m_encryptBuffer;  // EncryptFrameOut output buffer
+
     std::atomic<uint32_t> m_screenWidth{1920};
     std::atomic<uint32_t> m_screenHeight{1080};
     std::atomic<uint32_t> m_codecType{0};  // 0=H.264, 1=HEVC

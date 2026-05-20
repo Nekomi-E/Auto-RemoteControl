@@ -9,6 +9,7 @@
 #include "Common/Utils/Logger.h"
 #include "Common/Utils/Timer.h"
 #include "Common/Utils/DebugScreenshot.h"
+#include <d3d11.h>
 #include <thread>
 
 ViewerSession::ViewerSession() {}
@@ -80,6 +81,21 @@ bool ViewerSession::SetRenderWindow(HWND hwnd) {
         return false;
     }
     m_overlay->Initialize(hwnd, m_renderer->GetD2DDeviceContext());
+
+    // Enable GPU decode path if the decoder can use the renderer's D3D11 device
+    LOG_INFO("Checking GPU decode path: decoder=%p rendererDevice=%p rendererContext=%p",
+             (void*)m_videoDecoder.get(),
+             (void*)m_renderer->GetDevice(),
+             (void*)m_renderer->GetContext());
+    if (m_videoDecoder && m_renderer->GetDevice()) {
+        m_videoDecoder->InitializeWithD3D11(
+            m_network->GetCodecType(), m_remoteWidth, m_remoteHeight,
+            m_renderer->GetDevice(), m_renderer->GetContext());
+    } else {
+        LOG_INFO("GPU decode path skipped: decoder=%d device=%p",
+                 m_videoDecoder ? 1 : 0, (void*)m_renderer->GetDevice());
+    }
+
     return true;
 }
 
@@ -110,6 +126,11 @@ void ViewerSession::Stop() {
         if (t.joinable()) t.join();
     }
 
+    if (m_latestFrame.nv12Texture) {
+        m_latestFrame.nv12Texture->Release();
+        m_latestFrame.nv12Texture = nullptr;
+    }
+
     if (m_renderer) m_renderer->Shutdown();
     if (m_overlay) m_overlay->Shutdown();
     if (m_audioRenderer) m_audioRenderer->Shutdown();
@@ -118,10 +139,13 @@ void ViewerSession::Stop() {
 void ViewerSession::RenderFrame() {
     if (!m_running) return;
 
-    // Render video
+    // Render video — prefer GPU NV12 path to avoid CPU upload
     {
         std::lock_guard lock(m_frameMutex);
-        if (m_latestFrame.width > 0 && !m_latestFrame.data.empty()) {
+        if (m_latestFrame.nv12Texture) {
+            m_renderer->RenderFrameNv12(m_latestFrame.nv12Texture,
+                                         m_latestFrame.width, m_latestFrame.height);
+        } else if (m_latestFrame.width > 0 && !m_latestFrame.data.empty()) {
             m_renderer->RenderFrame(m_latestFrame.data.data(),
                                      m_latestFrame.width, m_latestFrame.height);
         }
@@ -350,7 +374,7 @@ void ViewerSession::NetworkReceiveThread() {
 
 void ViewerSession::VideoDecodeThread() {
     LOG_INFO("[VideoDecode] Thread started");
-    uint32_t frames = 0, fails = 0;
+    uint32_t frames = 0, fails = 0, gpuFrames = 0;
     int64_t lastDebugSaveMs = 0;
     uint32_t debugSaveCount = 0;
 
@@ -358,38 +382,71 @@ void ViewerSession::VideoDecodeThread() {
         auto vp = m_videoQueue.tryPop(50);
         if (!vp) continue;
 
-        std::vector<uint8_t> rgba;
-        uint32_t width = 0, height = 0;
-        if (m_videoDecoder->DecodeFrame(vp->data.data(), vp->data.size(),
-                                         rgba, width, height)) {
-            std::lock_guard lock(m_frameMutex);
-            m_latestFrame.data = std::move(rgba);
-            m_latestFrame.width = width;
-            m_latestFrame.height = height;
-            frames++;
-            m_decodedFrameCount++;
-            if (frames == 1) {
-                LOG_INFO("[VideoDecode] First frame decoded: %ux%u (key=%d input=%zu bytes)",
-                         width, height, vp->isKeyFrame, vp->data.size());
+        // Try GPU decode path first — keeps NV12 on GPU, zero CPU readback
+        bool decoded = false;
+        if (m_videoDecoder->HasGpuPath()) {
+            ID3D11Texture2D* nv12Tex = nullptr;
+            uint32_t width = 0, height = 0;
+            if (m_videoDecoder->DecodeFrameGpu(vp->data.data(), vp->data.size(),
+                                                nv12Tex, width, height)) {
+                std::lock_guard lock(m_frameMutex);
+                // Release previous GPU texture
+                if (m_latestFrame.nv12Texture) m_latestFrame.nv12Texture->Release();
+                m_latestFrame.nv12Texture = nv12Tex;
+                m_latestFrame.data.clear();
+                m_latestFrame.width = width;
+                m_latestFrame.height = height;
+                frames++;
+                gpuFrames++;
+                m_decodedFrameCount++;
+                decoded = true;
+                if (frames == 1) {
+                    LOG_INFO("[VideoDecode] First frame decoded (GPU): %ux%u (key=%d input=%zu bytes)",
+                             width, height, vp->isKeyFrame, vp->data.size());
+                }
             }
+        }
 
-            // DEBUG: Save decoded RGBA frame to BMP every ~5 seconds (up to 10)
-            auto now = Timer::NowMs();
-            if (debugSaveCount < 10 && (debugSaveCount == 0 || now - lastDebugSaveMs >= 5000)) {
-                lastDebugSaveMs = now;
-                debugSaveCount++;
-                std::vector<uint8_t> copyForSave = m_latestFrame.data;
-                std::thread([](std::vector<uint8_t> data, uint32_t w, uint32_t h, uint32_t cnt) {
-                    char prefix[64];
-                    snprintf(prefix, sizeof(prefix), "viewer_decoded_%u", cnt);
-                    SaveBmp(prefix, data.data(), w, h, false);
-                }, std::move(copyForSave), m_latestFrame.width, m_latestFrame.height, debugSaveCount).detach();
+        // CPU fallback
+        if (!decoded) {
+            std::vector<uint8_t> rgba;
+            uint32_t width = 0, height = 0;
+            if (m_videoDecoder->DecodeFrame(vp->data.data(), vp->data.size(),
+                                             rgba, width, height)) {
+                std::lock_guard lock(m_frameMutex);
+                if (m_latestFrame.nv12Texture) {
+                    m_latestFrame.nv12Texture->Release();
+                    m_latestFrame.nv12Texture = nullptr;
+                }
+                m_latestFrame.data = std::move(rgba);
+                m_latestFrame.width = width;
+                m_latestFrame.height = height;
+                frames++;
+                m_decodedFrameCount++;
+                if (frames == 1) {
+                    LOG_INFO("[VideoDecode] First frame decoded (CPU): %ux%u (key=%d input=%zu bytes)",
+                             width, height, vp->isKeyFrame, vp->data.size());
+                }
+
+                // DEBUG: Save decoded RGBA frame to BMP every ~5 seconds (up to 10)
+                auto now = Timer::NowMs();
+                if (debugSaveCount < 10 && (debugSaveCount == 0 || now - lastDebugSaveMs >= 5000)) {
+                    lastDebugSaveMs = now;
+                    debugSaveCount++;
+                    std::vector<uint8_t> copyForSave = m_latestFrame.data;
+                    std::thread([](std::vector<uint8_t> data, uint32_t w, uint32_t h, uint32_t cnt) {
+                        char prefix[64];
+                        snprintf(prefix, sizeof(prefix), "viewer_decoded_%u", cnt);
+                        SaveBmp(prefix, data.data(), w, h, false);
+                    }, std::move(copyForSave), m_latestFrame.width, m_latestFrame.height, debugSaveCount).detach();
+                }
+            } else {
+                fails++;
             }
-        } else {
-            fails++;
         }
     }
-    LOG_INFO("[VideoDecode] Thread stopped, %u frames decoded, %u fails", frames, fails);
+    LOG_INFO("[VideoDecode] Thread stopped, %u frames (%u GPU, %u CPU), %u fails",
+             frames, gpuFrames, frames - gpuFrames, fails);
 }
 
 void ViewerSession::AudioDecodeThread() {

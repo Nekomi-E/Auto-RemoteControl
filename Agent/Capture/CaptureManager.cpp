@@ -166,6 +166,15 @@ bool CaptureManager::AcquireFrame(std::vector<uint8_t>& outData, uint32_t& width
     return true;
 }
 
+bool CaptureManager::AcquireFrameGpu(CapturedFrameGpu& outFrame) {
+    if (!m_impl->running || !m_impl->screenCapture) return false;
+    return m_impl->screenCapture->AcquireFrameGpu(outFrame);
+}
+
+void CaptureManager::ReleaseGpuFrame() {
+    if (m_impl->screenCapture) m_impl->screenCapture->ReleaseGpuFrame();
+}
+
 bool CaptureManager::AcquireAudio(std::vector<uint8_t>& outData) {
     if (!m_impl->audioCapture) return false;
     if (m_impl->audioCapture->GetBuffer(outData)) {

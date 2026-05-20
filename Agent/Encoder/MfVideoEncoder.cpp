@@ -38,6 +38,7 @@ struct MfVideoEncoder::Impl {
     uint32_t fps = 60;
     uint32_t frameIndex = 0;
     uint32_t codecType = 0;           // 0=H.264, 1=HEVC
+    uint32_t quality = 0;             // 0=auto, 1=balanced, 2=lossless
 
     bool initialized = false;
     bool needKeyFrame = true;
@@ -201,11 +202,13 @@ bool MfVideoEncoder::SetupEncoderCandidate(
 }
 
 bool MfVideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t bitrate, uint32_t fps,
+                                uint32_t quality,
                                 ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext) {
     m_impl->width = width;
     m_impl->height = height;
     m_impl->bitrate = bitrate;
     m_impl->fps = fps;
+    m_impl->quality = quality;
 
     HRESULT hr = MFStartup(MF_VERSION);
     if (FAILED(hr)) {
@@ -497,12 +500,26 @@ void MfVideoEncoder::Shutdown() {
     m_impl->vpValidated = false;
 }
 
-// Compute a minimum bitrate for visually transparent quality at the given resolution.
-// Uses 0.5 bits-per-pixel — HEVC at this rate produces no visible blocking/banding
-// even on gradient-heavy content (smooth grayscale ramps, sky gradients, etc.).
-static uint32_t ComputeMinBitrate(uint32_t width, uint32_t height, uint32_t fps) {
+// Compute minimum bitrate for the given quality level.
+// HEVC needs ~half the bitrate of H.264 for equivalent quality at high resolutions.
+// Quality levels:
+//   0 (auto)     → 0.75 bpp (HEVC) / 1.25 bpp (H.264)
+//   1 (balanced) → 0.75 bpp (HEVC) / 1.25 bpp (H.264)
+//   2 (lossless) → 1.50 bpp (HEVC) / 2.50 bpp (H.264)
+//   bpp chosen to achieve visually lossless quality with no blocking/banding
+//   on gradient-heavy content (smooth grayscale ramps, sky gradients, etc.).
+static uint32_t ComputeMinBitrate(uint32_t width, uint32_t height, uint32_t fps,
+                                   uint32_t codecType, uint32_t quality) {
     uint64_t pixels = static_cast<uint64_t>(width) * height;
-    uint32_t minBps = static_cast<uint32_t>(pixels * fps / 2);
+    uint32_t bppNumerator, bppDenominator = 10;
+    if (codecType == 1) { // HEVC
+        if (quality >= 2)      bppNumerator = 15; // 1.5 bpp
+        else                   bppNumerator = 7;  // 0.75 bpp (rounded from 7.5)
+    } else { // H.264
+        if (quality >= 2)      bppNumerator = 25; // 2.5 bpp
+        else                   bppNumerator = 12; // 1.25 bpp (rounded from 12.5)
+    }
+    uint32_t minBps = static_cast<uint32_t>(pixels * fps * bppNumerator / bppDenominator);
     if (minBps < 4000000) minBps = 4000000;
     return minBps;
 }
@@ -739,7 +756,8 @@ bool MfVideoEncoder::TrySetOutputType(uint32_t resW, uint32_t resH) {
         MFSetAttributeRatio(m_impl->outputType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
         if (oc.setBitrate) {
-            uint32_t minBr = ComputeMinBitrate(resW, resH, m_impl->fps);
+            uint32_t minBr = ComputeMinBitrate(resW, resH, m_impl->fps,
+                                                m_impl->codecType, m_impl->quality);
             if (m_impl->bitrate < minBr) {
                 LOG_WARNING("Bitrate %u too low for %ux%u, increasing to %u",
                            m_impl->bitrate, resW, resH, minBr);
@@ -1272,6 +1290,195 @@ bool MfVideoEncoder::ConvertBgraToNv12Gpu(MfVideoEncoder::Impl* impl,
     return true;
 }
 
+// GPU-texture variant: takes a D3D11 BGRA texture directly from the capture
+// pipeline, copies it to the encoder's internal surface via intra-GPU copy,
+// then runs the video processor for BGRA→NV12 conversion.
+bool MfVideoEncoder::ConvertTextureToNv12Gpu(Impl* impl, ID3D11Texture2D* bgraTexture,
+                                             uint32_t width, uint32_t height,
+                                             IMFSample** outSample) {
+    *outSample = nullptr;
+
+    if (impl->vpValidated && !impl->vpWorking)
+        return false;
+
+    if (!InitVideoProcessor(impl, width, height))
+        return false;
+
+    // Intra-GPU copy: captured BGRA texture → encoder's cached BGRA surface
+    impl->d3dContext->CopyResource(impl->bgraGpuTex, bgraTexture);
+
+    // Set stream source rect to full frame
+    RECT srcRect = { 0, 0, (LONG)width, (LONG)height };
+    impl->videoContext->VideoProcessorSetStreamSourceRect(impl->videoProcessor, 0, TRUE, &srcRect);
+    impl->videoContext->VideoProcessorSetStreamDestRect(impl->videoProcessor, 0, TRUE, &srcRect);
+
+    // BGRA → NV12 via hardware video processor
+    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+    stream.Enable = TRUE;
+    stream.OutputIndex = 0;
+    stream.InputFrameOrField = 0;
+    stream.PastFrames = 0;
+    stream.FutureFrames = 0;
+    stream.ppPastSurfaces = nullptr;
+    stream.pInputSurface = impl->vpInputView;
+    stream.ppFutureSurfaces = nullptr;
+
+    HRESULT hr = impl->videoContext->VideoProcessorBlt(
+        impl->videoProcessor, impl->vpOutputView, 0, 1, &stream);
+    if (FAILED(hr)) return false;
+
+    impl->d3dContext->Flush();
+
+    // Wrap NV12 GPU texture as IMFMediaBuffer
+    IMFMediaBuffer* mediaBuffer = nullptr;
+    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), impl->nv12GpuTex,
+                                    0, FALSE, &mediaBuffer);
+    if (FAILED(hr)) return false;
+
+    // One-time validation on first call
+    if (!impl->vpValidated) {
+        bool vpOk = false;
+        uint32_t nonZeroCount = 0;
+        D3D11_TEXTURE2D_DESC stagingDesc = {};
+        stagingDesc.Width  = width;
+        stagingDesc.Height = height;
+        stagingDesc.MipLevels = 1;
+        stagingDesc.ArraySize = 1;
+        stagingDesc.Format = DXGI_FORMAT_NV12;
+        stagingDesc.SampleDesc.Count = 1;
+        stagingDesc.Usage = D3D11_USAGE_STAGING;
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        ID3D11Texture2D* stagingTex = nullptr;
+        if (SUCCEEDED(impl->d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &stagingTex))) {
+            impl->d3dContext->CopyResource(stagingTex, impl->nv12GpuTex);
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            if (SUCCEEDED(impl->d3dContext->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+                const uint8_t* p = static_cast<const uint8_t*>(mapped.pData);
+                size_t checkBytes = (size_t)width * height;
+                if (checkBytes > 64) checkBytes = 64;
+                for (size_t i = 0; i < checkBytes; ++i)
+                    if (p[i] != 0) ++nonZeroCount;
+                impl->d3dContext->Unmap(stagingTex, 0);
+                vpOk = (nonZeroCount > 0);
+            }
+            stagingTex->Release();
+        }
+
+        impl->vpValidated = true;
+        impl->vpWorking = vpOk;
+        if (!vpOk) {
+            LOG_WARNING("GPU video processor produced all-black NV12 output, "
+                        "falling back to CPU conversion");
+            mediaBuffer->Release();
+            if (impl->vpInputView)  { impl->vpInputView->Release();  impl->vpInputView = nullptr; }
+            if (impl->vpOutputView) { impl->vpOutputView->Release(); impl->vpOutputView = nullptr; }
+            if (impl->videoProcessor) { impl->videoProcessor->Release(); impl->videoProcessor = nullptr; }
+            if (impl->vpEnumerator) { impl->vpEnumerator->Release(); impl->vpEnumerator = nullptr; }
+            if (impl->videoContext) { impl->videoContext->Release(); impl->videoContext = nullptr; }
+            if (impl->videoDevice)  { impl->videoDevice->Release();  impl->videoDevice = nullptr; }
+            if (impl->bgraGpuTex)   { impl->bgraGpuTex->Release();   impl->bgraGpuTex = nullptr; }
+            if (impl->nv12GpuTex)   { impl->nv12GpuTex->Release();   impl->nv12GpuTex = nullptr; }
+            impl->vpWidth = impl->vpHeight = 0;
+            return false;
+        }
+        LOG_INFO("GPU video processor validated (%u of %u Y pixels non-zero)",
+                 nonZeroCount, (uint32_t)(width * height < 64 ? width * height : 64));
+    }
+
+    hr = MFCreateSample(outSample);
+    if (FAILED(hr)) { mediaBuffer->Release(); return false; }
+
+    (*outSample)->AddBuffer(mediaBuffer);
+    mediaBuffer->Release();
+    return true;
+}
+
+bool MfVideoEncoder::EncodeFrameGpu(ID3D11Texture2D* bgraTexture,
+                                     uint32_t width, uint32_t height,
+                                     std::vector<uint8_t>& outBitstream,
+                                     bool& outIsKeyFrame) {
+    if (!m_impl->initialized || !m_impl->d3dDevice || !m_impl->d3dContext)
+        return false;
+
+    outIsKeyFrame = false;
+
+    // GPU path: convert BGRA texture → NV12 via video processor → feed to MFT
+    IMFSample* sample = nullptr;
+    if (ConvertTextureToNv12Gpu(m_impl.get(), bgraTexture, width, height, &sample)) {
+        LONGLONG duration = 10000000LL / m_impl->fps;
+        LONGLONG timestamp = static_cast<LONGLONG>(m_impl->frameIndex) * duration;
+        sample->SetSampleTime(timestamp);
+        sample->SetSampleDuration(duration);
+
+        HRESULT hr = m_impl->mft->ProcessInput(0, sample, 0);
+        sample->Release();
+
+        if (hr == MF_E_NOTACCEPTING)
+            return true; // encoder not ready, will retry next frame
+
+        if (SUCCEEDED(hr)) {
+            if (ProcessOutput(outBitstream, outIsKeyFrame)) {
+                m_impl->frameIndex++;
+                if (outIsKeyFrame) m_impl->needKeyFrame = false;
+                if (m_impl->needKeyFrame || (m_impl->frameIndex % 120 == 0))
+                    RequestKeyFrame();
+                return true;
+            }
+        }
+        // GPU path failed at ProcessInput or ProcessOutput — fall through to CPU
+    }
+
+    // CPU fallback: read back BGRA texture and encode via CPU path.
+    // Uses a staging texture to get the GPU data back to system memory.
+    // Only happens when the GPU video processor or encoder MFT fails
+    // (driver quirks, resource pressure, etc.).
+    D3D11_TEXTURE2D_DESC texDesc;
+    bgraTexture->GetDesc(&texDesc);
+    D3D11_TEXTURE2D_DESC stagingDesc = {};
+    stagingDesc.Width  = texDesc.Width;
+    stagingDesc.Height = texDesc.Height;
+    stagingDesc.MipLevels = 1;
+    stagingDesc.ArraySize = 1;
+    stagingDesc.Format = texDesc.Format;
+    stagingDesc.SampleDesc.Count = 1;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    ID3D11Texture2D* stagingTex = nullptr;
+    if (FAILED(m_impl->d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &stagingTex)))
+        return false;
+
+    m_impl->d3dContext->CopyResource(stagingTex, bgraTexture);
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    bool cpuOk = false;
+    if (SUCCEEDED(m_impl->d3dContext->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+        std::vector<uint8_t> cpuFrame(width * height * 4);
+        const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+        for (uint32_t row = 0; row < height; ++row)
+            memcpy(cpuFrame.data() + row * width * 4,
+                   src + row * mapped.RowPitch, width * 4);
+        m_impl->d3dContext->Unmap(stagingTex, 0);
+        stagingTex->Release();
+
+        cpuOk = EncodeFrame(cpuFrame.data(), width, height, outBitstream, outIsKeyFrame);
+        static bool loggedCpuFallback = false;
+        if (!loggedCpuFallback) {
+            LOG_INFO("EncodeFrameGpu: GPU path failed, fell back to CPU encode (one-time log)");
+            loggedCpuFallback = true;
+        }
+    } else {
+        stagingTex->Release();
+    }
+
+    return cpuOk;
+}
+
+ID3D11Device* MfVideoEncoder::GetD3DDevice() const {
+    return m_impl->d3dDevice;
+}
+
 bool MfVideoEncoder::ProcessInput(const uint8_t* rawFrame, uint32_t width, uint32_t height) {
     // Downscale if encoder resolution differs from input
     std::vector<uint8_t> scaled;
@@ -1475,7 +1682,8 @@ uint32_t MfVideoEncoder::GetCodecType() const { return m_impl->codecType; }
 
 void MfVideoEncoder::SetBitrate(uint32_t bitrate) {
     if (bitrate == 0) return; // auto — keep current
-    uint32_t minBr = ComputeMinBitrate(m_impl->width, m_impl->height, m_impl->fps);
+    uint32_t minBr = ComputeMinBitrate(m_impl->width, m_impl->height, m_impl->fps,
+                                        m_impl->codecType, m_impl->quality);
     if (bitrate < minBr) {
         LOG_WARNING("Bitrate %u too low for %ux%u, clamping to %u",
                     bitrate, m_impl->width, m_impl->height, minBr);

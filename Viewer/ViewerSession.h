@@ -8,6 +8,8 @@
 #include <vector>
 #include <windows.h>
 
+struct ID3D11Texture2D;
+
 class ViewerSession {
 public:
     ViewerSession();
@@ -61,7 +63,8 @@ private:
         uint32_t timestampMs = 0;
     };
     struct DecodedFrame {
-        std::vector<uint8_t> data; // RGBA for renderer
+        std::vector<uint8_t> data;          // RGBA for CPU renderer
+        ID3D11Texture2D* nv12Texture = nullptr; // NV12 GPU texture (GPU path)
         uint32_t width = 0;
         uint32_t height = 0;
     };
