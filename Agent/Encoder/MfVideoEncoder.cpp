@@ -58,11 +58,12 @@ struct MfVideoEncoder::Impl {
     ID3D11VideoContext* videoContext = nullptr;
     ID3D11VideoProcessorEnumerator* vpEnumerator = nullptr;
     ID3D11VideoProcessor* videoProcessor = nullptr;
-    ID3D11Texture2D* bgraGpuTex = nullptr;     // cached BGRA input
-    ID3D11Texture2D* nv12GpuTex = nullptr;     // cached NV12 output from video processor
+    ID3D11Texture2D* bgraGpuTex = nullptr;          // cached BGRA input (reused)
+    ID3D11Texture2D* nv12GpuTex[2] = {};            // double-buffered NV12 output
     ID3D11VideoProcessorInputView* vpInputView = nullptr;
-    ID3D11VideoProcessorOutputView* vpOutputView = nullptr;
-    uint32_t vpWidth = 0, vpHeight = 0;        // dimensions for cached VP resources
+    ID3D11VideoProcessorOutputView* vpOutputView[2] = {}; // one per NV12 buffer
+    uint32_t vpWidth = 0, vpHeight = 0;             // dimensions for cached VP resources
+    int vpNv12Idx = 0;                              // round-robin index for NV12 buffers
     bool vpWorking = false;                     // GPU VP produces valid output
     bool vpValidated = false;                   // VP output has been validated
 };
@@ -470,13 +471,17 @@ void MfVideoEncoder::Shutdown() {
     if (m_impl->deviceManager) m_impl->deviceManager->Release();
     if (m_impl->gpuTexture) m_impl->gpuTexture->Release();
     if (m_impl->vpInputView) m_impl->vpInputView->Release();
-    if (m_impl->vpOutputView) m_impl->vpOutputView->Release();
+    for (int i = 0; i < 2; ++i) {
+        if (m_impl->vpOutputView[i]) m_impl->vpOutputView[i]->Release();
+    }
     if (m_impl->videoProcessor) m_impl->videoProcessor->Release();
     if (m_impl->vpEnumerator) m_impl->vpEnumerator->Release();
     if (m_impl->videoContext) m_impl->videoContext->Release();
     if (m_impl->videoDevice) m_impl->videoDevice->Release();
     if (m_impl->bgraGpuTex) m_impl->bgraGpuTex->Release();
-    if (m_impl->nv12GpuTex) m_impl->nv12GpuTex->Release();
+    for (int i = 0; i < 2; ++i) {
+        if (m_impl->nv12GpuTex[i]) m_impl->nv12GpuTex[i]->Release();
+    }
     m_impl->mft = nullptr;
     m_impl->inputType = nullptr;
     m_impl->outputType = nullptr;
@@ -491,9 +496,11 @@ void MfVideoEncoder::Shutdown() {
     m_impl->vpEnumerator = nullptr;
     m_impl->videoProcessor = nullptr;
     m_impl->bgraGpuTex = nullptr;
-    m_impl->nv12GpuTex = nullptr;
+    m_impl->nv12GpuTex[0] = nullptr;
+    m_impl->nv12GpuTex[1] = nullptr;
     m_impl->vpInputView = nullptr;
-    m_impl->vpOutputView = nullptr;
+    m_impl->vpOutputView[0] = nullptr;
+    m_impl->vpOutputView[1] = nullptr;
     m_impl->vpWidth = 0;
     m_impl->vpHeight = 0;
     m_impl->vpWorking = false;
@@ -1077,13 +1084,17 @@ bool MfVideoEncoder::InitVideoProcessor(MfVideoEncoder::Impl* impl, uint32_t wid
 
     // Tear down old resources
     if (impl->vpInputView)  { impl->vpInputView->Release();  impl->vpInputView = nullptr; }
-    if (impl->vpOutputView) { impl->vpOutputView->Release(); impl->vpOutputView = nullptr; }
+    for (int i = 0; i < 2; ++i) {
+        if (impl->vpOutputView[i]) { impl->vpOutputView[i]->Release(); impl->vpOutputView[i] = nullptr; }
+    }
     if (impl->videoProcessor) { impl->videoProcessor->Release(); impl->videoProcessor = nullptr; }
     if (impl->vpEnumerator) { impl->vpEnumerator->Release(); impl->vpEnumerator = nullptr; }
     if (impl->videoContext) { impl->videoContext->Release(); impl->videoContext = nullptr; }
     if (impl->videoDevice)  { impl->videoDevice->Release();  impl->videoDevice = nullptr; }
     if (impl->bgraGpuTex)   { impl->bgraGpuTex->Release();   impl->bgraGpuTex = nullptr; }
-    if (impl->nv12GpuTex)   { impl->nv12GpuTex->Release();   impl->nv12GpuTex = nullptr; }
+    for (int i = 0; i < 2; ++i) {
+        if (impl->nv12GpuTex[i]) { impl->nv12GpuTex[i]->Release(); impl->nv12GpuTex[i] = nullptr; }
+    }
 
     HRESULT hr;
 
@@ -1129,8 +1140,11 @@ bool MfVideoEncoder::InitVideoProcessor(MfVideoEncoder::Impl* impl, uint32_t wid
         if (FAILED(hr)) return false;
     }
 
-    // Create cached NV12 output texture (default, GPU-only — video processor target)
-    {
+    // Create double-buffered NV12 output textures.
+    // The encoder MFT may read NV12 data asynchronously on a separate GPU queue.
+    // Alternating between two textures ensures VideoProcessorBlt never overwrites
+    // an NV12 surface the encoder is still consuming.
+    for (int i = 0; i < 2; ++i) {
         D3D11_TEXTURE2D_DESC desc = {};
         desc.Width = width;
         desc.Height = height;
@@ -1140,11 +1154,12 @@ bool MfVideoEncoder::InitVideoProcessor(MfVideoEncoder::Impl* impl, uint32_t wid
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        hr = impl->d3dDevice->CreateTexture2D(&desc, nullptr, &impl->nv12GpuTex);
+        hr = impl->d3dDevice->CreateTexture2D(&desc, nullptr, &impl->nv12GpuTex[i]);
         if (FAILED(hr)) return false;
     }
+    impl->vpNv12Idx = 0;
 
-    // Create video processor input view (BGRA)
+    // Create video processor input view (BGRA) — single, reused each frame
     {
         D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
         ivDesc.FourCC = 0;
@@ -1156,23 +1171,25 @@ bool MfVideoEncoder::InitVideoProcessor(MfVideoEncoder::Impl* impl, uint32_t wid
         if (FAILED(hr)) return false;
     }
 
-    // Create video processor output view (NV12)
-    {
+    // Create video processor output views — one per NV12 buffer
+    for (int i = 0; i < 2; ++i) {
         D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc = {};
         ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
         hr = impl->videoDevice->CreateVideoProcessorOutputView(
-            impl->nv12GpuTex, impl->vpEnumerator, &ovDesc, &impl->vpOutputView);
+            impl->nv12GpuTex[i], impl->vpEnumerator, &ovDesc, &impl->vpOutputView[i]);
         if (FAILED(hr)) return false;
     }
 
-    // Set color space: input BGRA is full-range sRGB (0-255) from DXGI capture,
-    // output NV12 uses BT.601 limited range (TV levels, 16-235) for Y.
+    // Set color space: input BGRA is full-range sRGB (0-255) from DXGI capture.
+    // Output NV12 uses BT.709 (standard for HD/HD+ content ≥1280x720) with
+    // limited range (TV levels 16-235 Y, 16-240 UV) — the most compatible
+    // setting for HEVC/H.264 hardware encoders.
     {
         D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCS = {};
         inCS.YCbCr_Matrix   = 0;  // BT.601 (ignored for RGB input)
         inCS.Nominal_Range  = 0;  // 0-255 full range (sRGB from DXGI)
         D3D11_VIDEO_PROCESSOR_COLOR_SPACE outCS = {};
-        outCS.YCbCr_Matrix  = 0;  // BT.601
+        outCS.YCbCr_Matrix  = 1;  // BT.709 (standard for HD content)
         outCS.Nominal_Range = 1;  // 16-235 limited range (TV levels for NV12)
         impl->videoContext->VideoProcessorSetStreamColorSpace(impl->videoProcessor, 0, &inCS);
         impl->videoContext->VideoProcessorSetOutputColorSpace(impl->videoProcessor, &outCS);
@@ -1207,6 +1224,11 @@ bool MfVideoEncoder::ConvertBgraToNv12Gpu(MfVideoEncoder::Impl* impl,
     impl->videoContext->VideoProcessorSetStreamSourceRect(impl->videoProcessor, 0, TRUE, &srcRect);
     impl->videoContext->VideoProcessorSetStreamDestRect(impl->videoProcessor, 0, TRUE, &srcRect);
 
+    // Select next NV12 buffer in the double-buffered pair so the encoder
+    // can safely read the PREVIOUS frame's NV12 data while we write this one.
+    int bufIdx = impl->vpNv12Idx;
+    impl->vpNv12Idx ^= 1;
+
     // BGRA → NV12 via hardware video processor
     D3D11_VIDEO_PROCESSOR_STREAM stream = {};
     stream.Enable = TRUE;
@@ -1219,7 +1241,7 @@ bool MfVideoEncoder::ConvertBgraToNv12Gpu(MfVideoEncoder::Impl* impl,
     stream.ppFutureSurfaces = nullptr;
 
     hr = impl->videoContext->VideoProcessorBlt(
-        impl->videoProcessor, impl->vpOutputView, 0, 1, &stream);
+        impl->videoProcessor, impl->vpOutputView[bufIdx], 0, 1, &stream);
     if (FAILED(hr)) return false;
 
     // Flush the D3D11 immediate context so the GPU finishes writing the NV12
@@ -1229,7 +1251,7 @@ bool MfVideoEncoder::ConvertBgraToNv12Gpu(MfVideoEncoder::Impl* impl,
 
     // Wrap NV12 GPU texture as IMFMediaBuffer
     IMFMediaBuffer* mediaBuffer = nullptr;
-    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), impl->nv12GpuTex,
+    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), impl->nv12GpuTex[bufIdx],
                                     0, FALSE, &mediaBuffer);
     if (FAILED(hr)) return false;
 
@@ -1250,7 +1272,7 @@ bool MfVideoEncoder::ConvertBgraToNv12Gpu(MfVideoEncoder::Impl* impl,
 
         ID3D11Texture2D* stagingTex = nullptr;
         if (SUCCEEDED(impl->d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &stagingTex))) {
-            impl->d3dContext->CopyResource(stagingTex, impl->nv12GpuTex);
+            impl->d3dContext->CopyResource(stagingTex, impl->nv12GpuTex[bufIdx]);
             D3D11_MAPPED_SUBRESOURCE mapped;
             if (SUCCEEDED(impl->d3dContext->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
                 const uint8_t* p = static_cast<const uint8_t*>(mapped.pData);
@@ -1272,13 +1294,15 @@ bool MfVideoEncoder::ConvertBgraToNv12Gpu(MfVideoEncoder::Impl* impl,
             mediaBuffer->Release();
             // Tear down VP resources so they aren't reused
             if (impl->vpInputView)  { impl->vpInputView->Release();  impl->vpInputView = nullptr; }
-            if (impl->vpOutputView) { impl->vpOutputView->Release(); impl->vpOutputView = nullptr; }
+            for (int i = 0; i < 2; ++i) {
+                if (impl->vpOutputView[i]) { impl->vpOutputView[i]->Release(); impl->vpOutputView[i] = nullptr; }
+                if (impl->nv12GpuTex[i])   { impl->nv12GpuTex[i]->Release();   impl->nv12GpuTex[i] = nullptr; }
+            }
             if (impl->videoProcessor) { impl->videoProcessor->Release(); impl->videoProcessor = nullptr; }
             if (impl->vpEnumerator) { impl->vpEnumerator->Release(); impl->vpEnumerator = nullptr; }
             if (impl->videoContext) { impl->videoContext->Release(); impl->videoContext = nullptr; }
             if (impl->videoDevice)  { impl->videoDevice->Release();  impl->videoDevice = nullptr; }
             if (impl->bgraGpuTex)   { impl->bgraGpuTex->Release();   impl->bgraGpuTex = nullptr; }
-            if (impl->nv12GpuTex)   { impl->nv12GpuTex->Release();   impl->nv12GpuTex = nullptr; }
             impl->vpWidth = impl->vpHeight = 0;
             return false;
         }
@@ -1324,6 +1348,10 @@ bool MfVideoEncoder::ConvertTextureToNv12Gpu(Impl* impl, ID3D11Texture2D* bgraTe
     impl->videoContext->VideoProcessorSetStreamSourceRect(impl->videoProcessor, 0, TRUE, &srcRect);
     impl->videoContext->VideoProcessorSetStreamDestRect(impl->videoProcessor, 0, TRUE, &srcRect);
 
+    // Select next NV12 buffer in the double-buffered pair.
+    int bufIdx = impl->vpNv12Idx;
+    impl->vpNv12Idx ^= 1;
+
     // BGRA → NV12 via hardware video processor
     D3D11_VIDEO_PROCESSOR_STREAM stream = {};
     stream.Enable = TRUE;
@@ -1336,14 +1364,14 @@ bool MfVideoEncoder::ConvertTextureToNv12Gpu(Impl* impl, ID3D11Texture2D* bgraTe
     stream.ppFutureSurfaces = nullptr;
 
     HRESULT hr = impl->videoContext->VideoProcessorBlt(
-        impl->videoProcessor, impl->vpOutputView, 0, 1, &stream);
+        impl->videoProcessor, impl->vpOutputView[bufIdx], 0, 1, &stream);
     if (FAILED(hr)) return false;
 
     impl->d3dContext->Flush();
 
     // Wrap NV12 GPU texture as IMFMediaBuffer
     IMFMediaBuffer* mediaBuffer = nullptr;
-    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), impl->nv12GpuTex,
+    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), impl->nv12GpuTex[bufIdx],
                                     0, FALSE, &mediaBuffer);
     if (FAILED(hr)) return false;
 
@@ -1363,7 +1391,7 @@ bool MfVideoEncoder::ConvertTextureToNv12Gpu(Impl* impl, ID3D11Texture2D* bgraTe
 
         ID3D11Texture2D* stagingTex = nullptr;
         if (SUCCEEDED(impl->d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &stagingTex))) {
-            impl->d3dContext->CopyResource(stagingTex, impl->nv12GpuTex);
+            impl->d3dContext->CopyResource(stagingTex, impl->nv12GpuTex[bufIdx]);
             D3D11_MAPPED_SUBRESOURCE mapped;
             if (SUCCEEDED(impl->d3dContext->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
                 const uint8_t* p = static_cast<const uint8_t*>(mapped.pData);
@@ -1384,13 +1412,15 @@ bool MfVideoEncoder::ConvertTextureToNv12Gpu(Impl* impl, ID3D11Texture2D* bgraTe
                         "falling back to CPU conversion");
             mediaBuffer->Release();
             if (impl->vpInputView)  { impl->vpInputView->Release();  impl->vpInputView = nullptr; }
-            if (impl->vpOutputView) { impl->vpOutputView->Release(); impl->vpOutputView = nullptr; }
+            for (int i = 0; i < 2; ++i) {
+                if (impl->vpOutputView[i]) { impl->vpOutputView[i]->Release(); impl->vpOutputView[i] = nullptr; }
+                if (impl->nv12GpuTex[i])   { impl->nv12GpuTex[i]->Release();   impl->nv12GpuTex[i] = nullptr; }
+            }
             if (impl->videoProcessor) { impl->videoProcessor->Release(); impl->videoProcessor = nullptr; }
             if (impl->vpEnumerator) { impl->vpEnumerator->Release(); impl->vpEnumerator = nullptr; }
             if (impl->videoContext) { impl->videoContext->Release(); impl->videoContext = nullptr; }
             if (impl->videoDevice)  { impl->videoDevice->Release();  impl->videoDevice = nullptr; }
             if (impl->bgraGpuTex)   { impl->bgraGpuTex->Release();   impl->bgraGpuTex = nullptr; }
-            if (impl->nv12GpuTex)   { impl->nv12GpuTex->Release();   impl->nv12GpuTex = nullptr; }
             impl->vpWidth = impl->vpHeight = 0;
             return false;
         }

@@ -494,11 +494,76 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
     // underlying surface; the pool texture guarantees the encoder always
     // sees valid data regardless of when the encode thread processes it.
     {
+        // Validate pool format matches capture format. DXGI desktop duplication
+        // typically produces B8G8R8A8_UNORM, but some GPU configurations
+        // (Optimus, HDR displays) may use R8G8B8A8 or even FP16 formats.
+        // A format mismatch causes CopySubresourceRegion to fail silently,
+        // leaving stale pool data that encodes as green/magenta block artifacts.
+        D3D11_TEXTURE2D_DESC srcDesc;
+        srcTexture->GetDesc(&srcDesc);
+
+        static DXGI_FORMAT loggedPoolFmt = DXGI_FORMAT_UNKNOWN;
+        if (loggedPoolFmt != srcDesc.Format) {
+            loggedPoolFmt = srcDesc.Format;
+            LOG_INFO("[CaptureGpu] Source texture format: %d (%s)", (int)srcDesc.Format,
+                     srcDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ? "BGRA8" :
+                     srcDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? "RGBA8" :
+                     srcDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? "RGBA16F" : "other");
+        }
+
+        // If the pool was created with a different format, recreate it
+        if (mc.poolWidth > 0 && !mc.safePool[0]) {
+            // pool was cleaned up by reinit — nothing to check
+        } else if (mc.safePool[0]) {
+            D3D11_TEXTURE2D_DESC poolDesc;
+            mc.safePool[0]->GetDesc(&poolDesc);
+            if (poolDesc.Format != srcDesc.Format) {
+                LOG_WARNING("[CaptureGpu] Pool format mismatch (pool=%d src=%d), recreating pool",
+                           (int)poolDesc.Format, (int)srcDesc.Format);
+                for (int i = 0; i < kSafePoolSize; ++i) {
+                    if (mc.safePool[i]) {
+                        mc.safePool[i]->Release();
+                        mc.safePool[i] = nullptr;
+                    }
+                }
+                mc.poolWidth = 0; // force recreation below
+            }
+        }
+
+        // Recreate pool if needed (first time or format changed)
+        if (!mc.safePool[0] && mc.desc.width > 0) {
+            D3D11_TEXTURE2D_DESC poolDesc = {};
+            poolDesc.Width = mc.desc.width;
+            poolDesc.Height = mc.desc.height;
+            poolDesc.MipLevels = 1;
+            poolDesc.ArraySize = 1;
+            poolDesc.Format = srcDesc.Format;
+            poolDesc.SampleDesc.Count = 1;
+            poolDesc.Usage = D3D11_USAGE_DEFAULT;
+            poolDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+            for (int i = 0; i < kSafePoolSize; ++i) {
+                if (!mc.safePool[i]) {
+                    HRESULT poolHr = m_device->CreateTexture2D(&poolDesc, nullptr, &mc.safePool[i]);
+                    if (FAILED(poolHr)) {
+                        LOG_WARNING("Safe pool tex[%d] creation failed: 0x%08X", i, poolHr);
+                    }
+                }
+            }
+            mc.poolWidth = mc.desc.width;
+            mc.poolHeight = mc.desc.height;
+            mc.poolIndex = 0;
+            LOG_INFO("Safe texture pool allocated (on capture): %ux%u x%d fmt=%d",
+                     mc.poolWidth, mc.poolHeight, kSafePoolSize, (int)srcDesc.Format);
+        }
+
         ID3D11Texture2D* safeTex = mc.safePool[mc.poolIndex];
         if (safeTex) {
             D3D11_BOX box;
             box.left = 0; box.top = 0; box.front = 0;
             box.right = mc.desc.width; box.bottom = mc.desc.height; box.back = 1;
+            // CopySubresourceRegion returns void in D3D11; format mismatch is
+            // caught above by comparing poolDesc.Format to srcDesc.Format.
             m_context->CopySubresourceRegion(safeTex, 0, 0, 0, 0,
                                              srcTexture, 0, &box);
             safeTex->AddRef(); // caller takes ownership of this reference
