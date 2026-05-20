@@ -26,7 +26,7 @@ public:
 
     bool AcquireFrame(CapturedFrame& outFrame);
     bool AcquireFrameGpu(CapturedFrameGpu& outFrame);
-    void ReleaseGpuFrame(); // call after GPU frame processing is done
+    void ReleaseGpuFrame(); // no-op: frame released inside AcquireFrameGpu after safe copy
     void SetTargetFps(uint32_t fps) { m_targetFps = fps; }
     std::vector<MonitorDesc> GetMonitors() const;
 
@@ -34,6 +34,8 @@ private:
     bool InitDuplicationForOutput(int outputIndex);
     bool AcquireFromMonitor(int index, CapturedFrame& outFrame);
     bool AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFrame);
+
+    static constexpr int kSafePoolSize = 8;
 
     struct MonitorCapture {
         IDXGIOutputDuplication* duplication = nullptr;
@@ -43,6 +45,13 @@ private:
         std::vector<uint8_t> prevSample;             // previous frame's sample data
         int duplicateCount = 0;                      // consecutive identical frames
         bool valid = false;
+
+        // Pre-allocated texture pool to avoid per-frame CreateTexture2D (~16MB)
+        // overhead that causes 100-600ms GPU allocation stalls.
+        ID3D11Texture2D* safePool[kSafePoolSize] = {};
+        uint32_t poolWidth = 0;
+        uint32_t poolHeight = 0;
+        int poolIndex = 0;
     };
 
     ID3D11Device* m_device = nullptr;

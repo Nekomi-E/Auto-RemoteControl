@@ -840,6 +840,10 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
     bool mftProvidesSamples = (streamInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
     DWORD baseBufSize = streamInfo.cbSize ? streamInfo.cbSize : 1920 * 1080 * 3 / 2;
 
+    static int drainCallSeq = 0;
+    int mySeq = drainCallSeq++;
+    int processedCount = 0, gpuCount = 0, cpuCount = 0, dropCount = 0;
+
     for (;;) {
         MFT_OUTPUT_DATA_BUFFER outputBuffer = {};
         IMFSample* outSample = nullptr;
@@ -903,6 +907,7 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
             if (SUCCEEDED(buf->QueryInterface(IID_PPV_ARGS(&dxgiBuf)))) {
                 ID3D11Texture2D* tex = nullptr;
                 if (SUCCEEDED(dxgiBuf->GetResource(__uuidof(ID3D11Texture2D), (void**)&tex)) && tex) {
+                    processedCount++; gpuCount++;
                     if (outNv12Texture) outNv12Texture->Release();
                     outNv12Texture = tex;
                     outWidth = width;
@@ -964,13 +969,14 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
                         if (!formatEstablished) {
                             HandleStreamChange(mft, width, height, yStride, subtype, formatEstablished);
                         }
-                        static bool loggedOnce = false;
-                        if (!loggedOnce) {
+                        static int cpuUploadLogCount = 0;
+                        if (cpuUploadLogCount < 3) {
                             LOG_INFO("Decoder GPU drain: CPU-fallback upload %ux%u stride=%d",
                                      width, height, nv12Stride);
-                            loggedOnce = true;
+                            cpuUploadLogCount++;
                         }
                         gotBuffer = true;
+                        processedCount++; cpuCount++;
                     }
                     buf2d->Unlock2D();
                 }
@@ -1010,6 +1016,8 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
                         if (!formatEstablished) {
                             HandleStreamChange(mft, width, height, yStride, subtype, formatEstablished);
                         }
+                        gotBuffer = true;
+                        processedCount++; cpuCount++;
                     }
                     rawBuf->Unlock();
                 }
@@ -1017,7 +1025,15 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
             }
         }
 
+        if (!gotBuffer) {
+            dropCount++;
+        }
         outSample->Release();
+    }
+
+    if (processedCount > 0 && (mySeq & 0x3F) == 0) {
+        LOG_INFO("Decoder GPU drain #%d: processed=%d gpu=%d cpu=%d dropped=%d (mftProvidesSamples=%d)",
+                 mySeq, processedCount, gpuCount, cpuCount, dropCount, mftProvidesSamples ? 1 : 0);
     }
 
     return outNv12Texture != nullptr;

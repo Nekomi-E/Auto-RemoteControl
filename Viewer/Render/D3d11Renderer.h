@@ -82,6 +82,7 @@ private:
     ID3D11ShaderResourceView* m_vpBgraSRV = nullptr;
     uint32_t m_vpWidth = 0;
     uint32_t m_vpHeight = 0;
+    bool m_vpValidated = false;  // one-time VP output validation
 
     uint32_t m_textureWidth = 0;
     uint32_t m_textureHeight = 0;

@@ -80,6 +80,7 @@ private:
     // Decoded frame rate tracking (actual video FPS, not render/packet rate)
     std::atomic<uint32_t> m_decodedFrameCount{0};
     float m_decodedFps = 0.0f;
+    float m_renderTargetFps = 60.0f;  // smoothed, updated each second
 
     // Resize synchronization (main thread → render thread)
     std::mutex m_renderMutex;

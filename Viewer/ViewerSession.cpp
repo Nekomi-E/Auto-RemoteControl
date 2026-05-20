@@ -309,14 +309,25 @@ void ViewerSession::RenderThread() {
         // Update decoded FPS every second for smooth overlay display
         if (now - lastFpsUpdateTime >= 1000) {
             uint32_t decodedNow = m_decodedFrameCount.load();
-            m_decodedFps = static_cast<float>(
+            float instantFps = static_cast<float>(
                 (decodedNow - lastDecodedCount) * 1000.0f / (now - lastFpsUpdateTime));
+            m_decodedFps = instantFps;
             lastDecodedCount = decodedNow;
             lastFpsUpdateTime = now;
+
+            // Smooth the render target to avoid oscillation when decode rate varies
+            if (m_renderTargetFps == 60.0f && instantFps > 0.0f) {
+                m_renderTargetFps = instantFps;
+            } else if (instantFps > 0.0f) {
+                m_renderTargetFps = m_renderTargetFps * 0.7f + instantFps * 0.3f;
+            }
+            if (m_renderTargetFps < 10.0f) m_renderTargetFps = 10.0f;
+            if (m_renderTargetFps > 60.0f) m_renderTargetFps = 60.0f;
         }
 
-        // Pace to target frame rate (default 60fps)
-        int64_t targetInterval = 1000 / 60;
+        // Pace to actual decode rate so each new frame gets one present,
+        // avoiding irregular frame duplication that causes visible stutter.
+        int64_t targetInterval = static_cast<int64_t>(1000.0f / m_renderTargetFps);
         int64_t elapsed = now - lastFrameTime;
         if (elapsed < targetInterval) {
             Sleep(static_cast<DWORD>(targetInterval - elapsed));
@@ -412,15 +423,18 @@ void ViewerSession::VideoDecodeThread() {
                      vp->data.size(), vp->isKeyFrame ? 1 : 0, m_videoQueue.size());
         }
 
-        // Try GPU decode path first — keeps NV12 on GPU, zero CPU readback
-        bool decoded = false;
         if (m_videoDecoder->HasGpuPath()) {
+            // GPU path: DecodeFrameGpu feeds the data and drains ALL output.
+            // DrainDecoderOutputGpu handles both GPU-backed and system-memory
+            // buffers internally (CPU→GPU upload fallback). The MFT consumes
+            // the input in ProcessInput — do NOT call DecodeFrame afterwards
+            // (that would double-feed the same bitstream, causing the 50/50
+            // GPU/CPU decode split when the MFT surface pool alternates).
             ID3D11Texture2D* nv12Tex = nullptr;
             uint32_t width = 0, height = 0;
             if (m_videoDecoder->DecodeFrameGpu(vp->data.data(), vp->data.size(),
                                                 nv12Tex, width, height)) {
                 std::lock_guard lock(m_frameMutex);
-                // Release previous GPU texture
                 if (m_latestFrame.nv12Texture) m_latestFrame.nv12Texture->Release();
                 m_latestFrame.nv12Texture = nv12Tex;
                 m_latestFrame.data.clear();
@@ -429,16 +443,14 @@ void ViewerSession::VideoDecodeThread() {
                 frames++;
                 gpuFrames++;
                 m_decodedFrameCount++;
-                decoded = true;
                 if (frames == 1) {
                     LOG_INFO("[VideoDecode] First frame decoded (GPU): %ux%u (key=%d input=%zu bytes)",
                              width, height, vp->isKeyFrame, vp->data.size());
                 }
             }
-        }
-
-        // CPU fallback
-        if (!decoded) {
+            // No fallback — data already consumed by ProcessInput
+        } else {
+            // Pure CPU path: no GPU decode available at all
             std::vector<uint8_t> rgba;
             uint32_t width = 0, height = 0;
             if (m_videoDecoder->DecodeFrame(vp->data.data(), vp->data.size(),

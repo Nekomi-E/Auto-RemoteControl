@@ -1,5 +1,6 @@
 @echo off
 chcp 65001 >nul
+cd /d "%~dp0"
 setlocal
 
 :: ============================================================
@@ -32,7 +33,8 @@ taskkill /F /IM Viewer.exe >nul 2>&1
 timeout /t 1 /nobreak >nul
 
 echo [INFO] Starting Viewer connecting to %VIEWER_HOST%:%VIEWER_PORT%...
-start "RemoteControl-Viewer" "%VIEWER_EXE%" --host %VIEWER_HOST% --port %VIEWER_PORT% --password "%VIEWER_PASS%"
+echo.
+"%VIEWER_EXE%" --host %VIEWER_HOST% --port %VIEWER_PORT% --password "%VIEWER_PASS%"
 
-echo [INFO] Viewer started.
+pause
 endlocal
