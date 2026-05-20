@@ -6,6 +6,7 @@
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct ID3D11Texture2D;
 
 class EncoderManager {
 public:
@@ -28,7 +29,7 @@ public:
     ~EncoderManager();
 
     bool Initialize(uint32_t width, uint32_t height, uint32_t bitrate,
-                    uint32_t fps, bool enableAudio,
+                    uint32_t fps, bool enableAudio, uint32_t quality = 0,
                     ID3D11Device* d3dDevice = nullptr,
                     ID3D11DeviceContext* d3dContext = nullptr);
     void Stop();
@@ -36,6 +37,9 @@ public:
     void SubmitVideoFrame(std::vector<uint8_t> rawData,
                           uint32_t width, uint32_t height,
                           int64_t timestampMs);
+    void SubmitVideoFrameGpu(ID3D11Texture2D* gpuTexture,
+                             uint32_t width, uint32_t height,
+                             int64_t timestampMs);
     void SubmitAudioFrame(const std::vector<uint8_t>& rawData, int64_t timestampMs);
 
     bool GetEncodedVideoFrame(EncodedFrame& outFrame, int timeoutMs);

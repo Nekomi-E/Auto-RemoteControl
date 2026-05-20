@@ -8,6 +8,7 @@
 // Forward declarations
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct ID3D11Texture2D;  // for CapturedFrameGpu
 
 namespace Protocol { struct InputEvent; }
 
@@ -17,6 +18,16 @@ struct MonitorDesc {
     int32_t x = 0;
     int32_t y = 0;
     bool isPrimary = false;
+};
+
+// GPU captured frame: BGRA texture on GPU, no CPU readback.
+// caller must call ReleaseGpuFrame() after processing is done,
+// then Release() on the texture.
+struct CapturedFrameGpu {
+    ID3D11Texture2D* texture = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    int64_t timestampMs = 0;
 };
 
 class CaptureManager {
@@ -35,6 +46,10 @@ public:
 
     bool AcquireFrame(std::vector<uint8_t>& outData, uint32_t& width, uint32_t& height);
     bool AcquireAudio(std::vector<uint8_t>& outData);
+
+    // GPU path: returns the captured texture directly (no CPU readback).
+    bool AcquireFrameGpu(CapturedFrameGpu& outFrame);
+    void ReleaseGpuFrame();
 
     std::vector<MonitorDesc> GetMonitorDescs() const;
     void SetTargetFps(uint32_t fps);

@@ -17,6 +17,7 @@ struct EncoderManager::Impl {
     // Raw frame input queues
     struct RawVideoFrame {
         std::vector<uint8_t> data;
+        ID3D11Texture2D* gpuTexture = nullptr; // non-null = GPU path
         uint32_t width = 0;
         uint32_t height = 0;
         int64_t timestampMs = 0;
@@ -59,7 +60,7 @@ EncoderManager::EncoderManager() : m_impl(std::make_unique<Impl>()) {}
 EncoderManager::~EncoderManager() { Stop(); }
 
 bool EncoderManager::Initialize(uint32_t width, uint32_t height, uint32_t bitrate,
-                                 uint32_t fps, bool enableAudio,
+                                 uint32_t fps, bool enableAudio, uint32_t quality,
                                  ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext) {
     m_impl->frameWidth = width;
     m_impl->frameHeight = height;
@@ -69,7 +70,7 @@ bool EncoderManager::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
 
     // Initialize video encoder
     m_impl->videoEncoder = std::make_unique<MfVideoEncoder>();
-    if (!m_impl->videoEncoder->Initialize(width, height, bitrate, fps,
+    if (!m_impl->videoEncoder->Initialize(width, height, bitrate, fps, quality,
                                            d3dDevice, d3dContext)) {
         LOG_ERROR("Failed to initialize video encoder");
         return false;
@@ -98,9 +99,22 @@ bool EncoderManager::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
             if (frame) {
                 std::vector<uint8_t> bitstream;
                 bool isKeyFrame = false;
-                if (m_impl->videoEncoder->EncodeFrame(
+                bool ok = false;
+
+                if (frame->gpuTexture) {
+                    // GPU fast path: capture texture → video processor → encoder
+                    ok = m_impl->videoEncoder->EncodeFrameGpu(
+                        frame->gpuTexture, frame->width, frame->height,
+                        bitstream, isKeyFrame);
+                    frame->gpuTexture->Release();
+                } else {
+                    // CPU fallback: raw BGRA → NV12 → encoder
+                    ok = m_impl->videoEncoder->EncodeFrame(
                         frame->data.data(), frame->width, frame->height,
-                        bitstream, isKeyFrame)) {
+                        bitstream, isKeyFrame);
+                }
+
+                if (ok) {
                     EncodedFrame ef;
                     ef.data = std::move(bitstream);
                     ef.isKeyFrame = isKeyFrame;
@@ -170,6 +184,17 @@ void EncoderManager::SubmitVideoFrame(std::vector<uint8_t> rawData,
                                        int64_t timestampMs) {
     Impl::RawVideoFrame rf;
     rf.data = std::move(rawData);
+    rf.width = width;
+    rf.height = height;
+    rf.timestampMs = timestampMs;
+    m_impl->videoInputQueue.tryPush(std::move(rf));
+}
+
+void EncoderManager::SubmitVideoFrameGpu(ID3D11Texture2D* gpuTexture,
+                                         uint32_t width, uint32_t height,
+                                         int64_t timestampMs) {
+    Impl::RawVideoFrame rf;
+    rf.gpuTexture = gpuTexture; // caller transfers ownership (AddRef'd)
     rf.width = width;
     rf.height = height;
     rf.timestampMs = timestampMs;

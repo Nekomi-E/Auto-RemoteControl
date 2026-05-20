@@ -11,11 +11,19 @@ bool SecureChannel::Initialize(const std::vector<uint8_t>& aesKey) {
 
 std::vector<uint8_t> SecureChannel::EncryptFrame(const Protocol::FrameHeader& header,
                                                    const uint8_t* payload, size_t payloadLen) {
-    if (!m_aes.IsReady()) return {};
+    std::vector<uint8_t> result;
+    EncryptFrameOut(header, payload, payloadLen, result);
+    return result;
+}
 
-    // Generate random IV
-    std::vector<uint8_t> iv(AesGcm::IV_SIZE);
-    BCryptGenRandom(nullptr, iv.data(), static_cast<ULONG>(iv.size()),
+bool SecureChannel::EncryptFrameOut(const Protocol::FrameHeader& header,
+                                     const uint8_t* payload, size_t payloadLen,
+                                     std::vector<uint8_t>& outWireData) {
+    if (!m_aes.IsReady()) return false;
+
+    // Reuse IV buffer
+    m_iv.resize(AesGcm::IV_SIZE);
+    BCryptGenRandom(nullptr, m_iv.data(), static_cast<ULONG>(m_iv.size()),
                     BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
     // Serialize header for AAD
@@ -23,18 +31,18 @@ std::vector<uint8_t> SecureChannel::EncryptFrame(const Protocol::FrameHeader& he
 
     // Encrypt with IV and AAD
     auto encrypted = m_aes.EncryptWithIv(payload, payloadLen,
-                                          iv.data(), iv.size(),
+                                          m_iv.data(), m_iv.size(),
                                           headerBytes.data(), headerBytes.size());
-    if (encrypted.empty()) return {};
+    if (encrypted.empty()) return false;
 
-    // Prepend IV to form wire format: [IV][ciphertext][tag]
-    std::vector<uint8_t> result;
-    result.reserve(iv.size() + encrypted.size());
-    result.insert(result.end(), iv.begin(), iv.end());
-    result.insert(result.end(), encrypted.begin(), encrypted.end());
+    // Assemble wire format: [IV][ciphertext][tag] in output buffer
+    size_t totalSize = m_iv.size() + encrypted.size();
+    outWireData.resize(totalSize);
+    memcpy(outWireData.data(), m_iv.data(), m_iv.size());
+    memcpy(outWireData.data() + m_iv.size(), encrypted.data(), encrypted.size());
 
     m_encryptedCount++;
-    return result;
+    return true;
 }
 
 bool SecureChannel::DecryptFrame(const uint8_t* wireData, size_t wireLen,

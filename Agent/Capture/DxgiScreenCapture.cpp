@@ -145,6 +145,31 @@ bool DxgiScreenCapture::AcquireFrame(CapturedFrame& outFrame) {
     return false;
 }
 
+bool DxgiScreenCapture::AcquireFrameGpu(CapturedFrameGpu& outFrame) {
+    if (m_monitors.empty()) return false;
+
+    auto now = Timer::NowMs();
+    int64_t frameInterval = 1000 / m_targetFps;
+    int64_t elapsed = now - m_lastFrameTime;
+    if (elapsed < frameInterval) {
+        Sleep(static_cast<DWORD>(frameInterval - elapsed));
+        now = Timer::NowMs();
+    }
+
+    if (AcquireFromMonitorGpu(0, outFrame)) {
+        m_lastFrameTime = now;
+        outFrame.timestampMs = now;
+        return true;
+    }
+    return false;
+}
+
+void DxgiScreenCapture::ReleaseGpuFrame() {
+    if (!m_monitors.empty() && m_monitors[0].duplication) {
+        m_monitors[0].duplication->ReleaseFrame();
+    }
+}
+
 bool DxgiScreenCapture::AcquireFromMonitor(int index, CapturedFrame& outFrame) {
     auto& mc = m_monitors[index];
     if (!mc.valid || !mc.duplication) return false;
@@ -242,6 +267,45 @@ bool DxgiScreenCapture::AcquireFromMonitor(int index, CapturedFrame& outFrame) {
     mc.duplication->ReleaseFrame();
 
     return SUCCEEDED(hr);
+}
+
+bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFrame) {
+    auto& mc = m_monitors[index];
+    if (!mc.valid || !mc.duplication) return false;
+
+    IDXGIResource* frameResource = nullptr;
+    DXGI_OUTDUPL_FRAME_INFO frameInfo;
+    HRESULT hr = DXGI_ERROR_WAIT_TIMEOUT;
+
+    for (int retry = 0; retry < 3; ++retry) {
+        hr = mc.duplication->AcquireNextFrame(0, &frameInfo, &frameResource);
+        if (hr != DXGI_ERROR_WAIT_TIMEOUT) break;
+        if (retry < 2) Sleep(1);
+    }
+
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;
+    if (hr == DXGI_ERROR_ACCESS_LOST) {
+        LOG_WARNING("DXGI access lost on monitor %d, reinitializing", index);
+        InitDuplicationForOutput(index);
+        return false;
+    }
+    if (FAILED(hr)) return false;
+
+    ID3D11Texture2D* srcTexture = nullptr;
+    hr = frameResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&srcTexture);
+    frameResource->Release();
+
+    if (FAILED(hr)) {
+        mc.duplication->ReleaseFrame();
+        return false;
+    }
+
+    // Return the GPU texture directly — caller MUST call ReleaseGpuFrame()
+    // after processing is complete, then Release() the texture.
+    outFrame.texture = srcTexture; // already AddRef'd by QueryInterface
+    outFrame.width  = mc.desc.width;
+    outFrame.height = mc.desc.height;
+    return true;
 }
 
 std::vector<MonitorDesc> DxgiScreenCapture::GetMonitors() const {

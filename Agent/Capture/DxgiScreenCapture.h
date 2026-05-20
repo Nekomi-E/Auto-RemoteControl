@@ -25,12 +25,15 @@ public:
     void Shutdown();
 
     bool AcquireFrame(CapturedFrame& outFrame);
+    bool AcquireFrameGpu(CapturedFrameGpu& outFrame);
+    void ReleaseGpuFrame(); // call after GPU frame processing is done
     void SetTargetFps(uint32_t fps) { m_targetFps = fps; }
     std::vector<MonitorDesc> GetMonitors() const;
 
 private:
     bool InitDuplicationForOutput(int outputIndex);
     bool AcquireFromMonitor(int index, CapturedFrame& outFrame);
+    bool AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFrame);
 
     struct MonitorCapture {
         IDXGIOutputDuplication* duplication = nullptr;

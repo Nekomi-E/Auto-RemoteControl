@@ -1,10 +1,13 @@
 #include "D3d11Renderer.h"
 #include "Common/Utils/Logger.h"
 #include <d3d11.h>
+#include <d3d10.h>       // ID3D10Multithread
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <d2d1_1.h>
 #include <d3d11_1.h>
+
+#pragma comment(lib, "dxguid.lib")  // IID_ID3D10Multithread
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -52,6 +55,32 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 }
 )";
 
+// NV12 pixel shader: Y (t0, R8_UNORM) + UV (t1, R8G8_UNORM) → BGRA.
+// Matches Nv12ToBgra CPU path exactly — operates in 8-bit integer space
+// with BT.601 limited-range coefficients, then normalizes to [0,1].
+static const char g_PsNv12Source[] = R"(
+Texture2D<float>  texY  : register(t0);
+Texture2D<float2> texUV : register(t1);
+SamplerState      samp  : register(s0);
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float  Yf = texY.Sample(samp, uv).r * 255.0f;
+    float2 Cf = texUV.Sample(samp, uv).rg * 255.0f;
+    float y = Yf - 16.0f;
+    float u = Cf.r - 128.0f;
+    float v = Cf.g - 128.0f;
+
+    float r = (298.0f * y + 409.0f * v + 128.0f) / 256.0f;
+    float g = (298.0f * y - 100.0f * u - 208.0f * v + 128.0f) / 256.0f;
+    float b = (298.0f * y + 516.0f * u + 128.0f) / 256.0f;
+
+    r = saturate(r / 255.0f);
+    g = saturate(g / 255.0f);
+    b = saturate(b / 255.0f);
+    return float4(b, g, r, 1.0f);
+}
+)";
+
 D3d11Renderer::D3d11Renderer() {}
 
 D3d11Renderer::~D3d11Renderer() { Shutdown(); }
@@ -94,13 +123,25 @@ bool D3d11Renderer::CreateDeviceResources() {
         return false;
     }
 
+    // Enable multithread protection — required when the same D3D11 device is
+    // used from multiple threads (e.g. decode thread + render thread).
+    // ID3D10Multithread works for all D3D11 devices (same vtable layout).
+    {
+        ID3D10Multithread* mt = nullptr;
+        if (SUCCEEDED(m_device->QueryInterface(IID_ID3D10Multithread, (void**)&mt))) {
+            mt->SetMultithreadProtected(TRUE);
+            mt->Release();
+            LOG_INFO("D3D11 multithread protection enabled");
+        }
+    }
+
     // Create D2D device/context for overlay
     IDXGIDevice* dxgiDevice = nullptr;
     hr = m_device->QueryInterface(&dxgiDevice);
     if (SUCCEEDED(hr)) {
         D2D1_FACTORY_OPTIONS options = {};
         ID2D1Factory1* d2dFactory = nullptr;
-        hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED,
                                 IID_ID2D1Factory1, &options, (void**)&d2dFactory);
         if (SUCCEEDED(hr)) {
             ID2D1Device* d2dDevice = nullptr;
@@ -193,6 +234,29 @@ bool D3d11Renderer::CreateShaders() {
     if (FAILED(hr)) {
         LOG_ERROR("D3D11: CreatePixelShader failed: 0x%08X", hr);
         return false;
+    }
+
+    // Compile NV12 pixel shader
+    {
+        ID3DBlob* psNv12Blob = nullptr;
+        hr = D3DCompile(g_PsNv12Source, strlen(g_PsNv12Source), "ps", nullptr, nullptr,
+                         "main", "ps_4_0", 0, 0, &psNv12Blob, &errBlob);
+        if (FAILED(hr)) {
+            if (errBlob) {
+                LOG_ERROR("D3D11: NV12 PS compile: %s", (const char*)errBlob->GetBufferPointer());
+                errBlob->Release();
+            }
+            LOG_WARNING("NV12 pixel shader compile failed, GPU decode path disabled");
+            m_pixelShaderNv12 = nullptr;
+        } else {
+            hr = m_device->CreatePixelShader(psNv12Blob->GetBufferPointer(),
+                                              psNv12Blob->GetBufferSize(), nullptr, &m_pixelShaderNv12);
+            psNv12Blob->Release();
+            if (FAILED(hr)) {
+                LOG_WARNING("CreatePixelShader(NV12) failed: 0x%08X", hr);
+                m_pixelShaderNv12 = nullptr;
+            }
+        }
     }
 
     // Sampler state
@@ -296,9 +360,13 @@ void D3d11Renderer::Shutdown() {
     }
     if (m_inputLayout) m_inputLayout->Release();
     if (m_pixelShader) m_pixelShader->Release();
+    if (m_pixelShaderNv12) m_pixelShaderNv12->Release();
     if (m_vertexShader) m_vertexShader->Release();
     if (m_quadVB) m_quadVB->Release();
     if (m_sampler) m_sampler->Release();
+    if (m_nv12CopySRV_Y) m_nv12CopySRV_Y->Release();
+    if (m_nv12CopySRV_UV) m_nv12CopySRV_UV->Release();
+    if (m_nv12CopyTex) m_nv12CopyTex->Release();
     if (m_videoSRV) m_videoSRV->Release();
     if (m_videoTexture) m_videoTexture->Release();
     if (m_rtv) m_rtv->Release();
@@ -306,9 +374,13 @@ void D3d11Renderer::Shutdown() {
     if (m_context) m_context->Release();
     if (m_device) m_device->Release();
 
+    m_nv12CopySRV_Y = nullptr;
+    m_nv12CopySRV_UV = nullptr;
+    m_nv12CopyTex = nullptr;
     m_d2dContext = nullptr;
     m_inputLayout = nullptr;
     m_pixelShader = nullptr;
+    m_pixelShaderNv12 = nullptr;
     m_vertexShader = nullptr;
     m_quadVB = nullptr;
     m_sampler = nullptr;
@@ -432,6 +504,82 @@ void D3d11Renderer::RenderFrame(const uint8_t* rgbaData, uint32_t width, uint32_
             m_context->Draw(3, 0);
         }
     }
+}
+
+void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width, uint32_t height) {
+    if (!m_device || !m_context || !m_rtv || !nv12Texture) return;
+    if (!m_pixelShaderNv12) return;
+    if (width == 0 || height == 0) return;
+
+    // Recreate local copy texture + cached SRVs when dimensions change.
+    // The MFT's output texture may not have D3D11_BIND_SHADER_RESOURCE,
+    // so we CopyResource into our own texture that does.
+    if (!m_nv12CopyTex || m_nv12CopyWidth != width || m_nv12CopyHeight != height) {
+        if (m_nv12CopySRV_Y) { m_nv12CopySRV_Y->Release(); m_nv12CopySRV_Y = nullptr; }
+        if (m_nv12CopySRV_UV) { m_nv12CopySRV_UV->Release(); m_nv12CopySRV_UV = nullptr; }
+        if (m_nv12CopyTex)   { m_nv12CopyTex->Release(); m_nv12CopyTex = nullptr; }
+
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_NV12;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        HRESULT hr = m_device->CreateTexture2D(&desc, nullptr, &m_nv12CopyTex);
+        if (FAILED(hr)) {
+            LOG_WARNING("RenderFrameNv12: CreateTexture2D(NV12 %ux%u) failed: 0x%08X", width, height, hr);
+            return;
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvYDesc = {};
+        srvYDesc.Format = DXGI_FORMAT_R8_UNORM;
+        srvYDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvYDesc.Texture2D.MipLevels = 1;
+        hr = m_device->CreateShaderResourceView(m_nv12CopyTex, &srvYDesc, &m_nv12CopySRV_Y);
+        if (FAILED(hr)) {
+            LOG_WARNING("RenderFrameNv12: CreateSRV(Y) failed: 0x%08X", hr);
+            m_nv12CopyTex->Release(); m_nv12CopyTex = nullptr;
+            return;
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvUVDesc = {};
+        srvUVDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+        srvUVDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvUVDesc.Texture2D.MipLevels = 1;
+        hr = m_device->CreateShaderResourceView(m_nv12CopyTex, &srvUVDesc, &m_nv12CopySRV_UV);
+        if (FAILED(hr)) {
+            LOG_WARNING("RenderFrameNv12: CreateSRV(UV) failed: 0x%08X", hr);
+            m_nv12CopySRV_Y->Release(); m_nv12CopySRV_Y = nullptr;
+            m_nv12CopyTex->Release(); m_nv12CopyTex = nullptr;
+            return;
+        }
+
+        m_nv12CopyWidth = width;
+        m_nv12CopyHeight = height;
+        LOG_INFO("RenderFrameNv12: cached NV12 copy texture %ux%u", width, height);
+    }
+
+    // Copy decoder's NV12 texture into our local one (GPU-side, no CPU involvement)
+    m_context->CopyResource(m_nv12CopyTex, nv12Texture);
+
+    // Draw fullscreen triangle with NV12 pixel shader — uses cached SRVs
+    UINT stride = sizeof(QuadVertex);
+    UINT offset = 0;
+    m_context->IASetVertexBuffers(0, 1, &m_quadVB, &stride, &offset);
+    m_context->IASetInputLayout(m_inputLayout);
+    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_context->VSSetShader(m_vertexShader, nullptr, 0);
+    m_context->PSSetShader(m_pixelShaderNv12, nullptr, 0);
+
+    ID3D11ShaderResourceView* srvs[2] = { m_nv12CopySRV_Y, m_nv12CopySRV_UV };
+    m_context->PSSetShaderResources(0, 2, srvs);
+    m_context->PSSetSamplers(0, 1, &m_sampler);
+    m_context->OMSetRenderTargets(1, &m_rtv, nullptr);
+    m_context->Draw(3, 0);
 }
 
 void D3d11Renderer::Present() {

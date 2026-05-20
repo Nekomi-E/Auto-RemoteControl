@@ -32,6 +32,9 @@ AgentConfig Config::ParseAgentArgs(int argc, char* argv[]) {
             parseUint32(argv[++i], cfg.targetFps);
         } else if (strcmp(argv[i], "--no-audio") == 0) {
             cfg.enableAudio = false;
+        } else if (strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
+            parseUint32(argv[++i], cfg.videoQuality);
+            if (cfg.videoQuality > 2) cfg.videoQuality = 2;
         } else if (strcmp(argv[i], "--no-encrypt") == 0) {
             cfg.enableEncryption = false;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -73,6 +76,7 @@ void Config::PrintAgentHelp() {
     printf("  --password STR  Authentication password (required)\n");
     printf("  --bitrate N     Video bitrate in bps (default: auto, scaled to resolution)\n");
     printf("  --fps N         Target capture framerate (default: 60)\n");
+    printf("  --quality N     Video quality: 0=auto 1=balanced 2=lossless (default: 0)\n");
     printf("  --no-audio      Disable audio capture\n");
     printf("  --no-encrypt    Disable encryption (not recommended)\n");
     printf("  --help, -h      Show this help\n");
