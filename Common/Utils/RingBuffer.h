@@ -63,10 +63,12 @@ public:
     }
 
     size_t size() const {
+        // Return the number of items in the buffer. m_head and m_tail are
+        // monotonic counters (may wrap) so simple unsigned subtraction yields
+        // the correct difference modulo the counter width.
         size_t head = m_head.load(std::memory_order_acquire);
         size_t tail = m_tail.load(std::memory_order_acquire);
-        if (head >= tail) return head - tail;
-        return 0;
+        return head - tail;
     }
 
 private:

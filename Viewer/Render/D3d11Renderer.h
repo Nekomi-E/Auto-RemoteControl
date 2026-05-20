@@ -17,6 +17,13 @@ struct ID3D11PixelShader;
 struct ID3D11InputLayout;
 struct ID2D1DeviceContext;
 
+struct ID3D11VideoDevice;
+struct ID3D11VideoContext;
+struct ID3D11VideoProcessor;
+struct ID3D11VideoProcessorEnumerator;
+struct ID3D11VideoProcessorInputView;
+struct ID3D11VideoProcessorOutputView;
+
 class D3d11Renderer {
 public:
     D3d11Renderer();
@@ -59,14 +66,22 @@ private:
     ID3D11PixelShader* m_pixelShaderNv12 = nullptr;    // NV12→BGRA converter
     ID3D11InputLayout* m_inputLayout = nullptr;
 
-    // Cached NV12 copy texture + SRVs for GPU decode path.
-    // Incoming MFT textures may lack D3D11_BIND_SHADER_RESOURCE,
-    // so we CopyResource into our own texture and create SRVs once.
-    ID3D11Texture2D* m_nv12CopyTex = nullptr;
-    ID3D11ShaderResourceView* m_nv12CopySRV_Y = nullptr;
-    ID3D11ShaderResourceView* m_nv12CopySRV_UV = nullptr;
-    uint32_t m_nv12CopyWidth = 0;
-    uint32_t m_nv12CopyHeight = 0;
+    // Video Processor pipeline for NV12→BGRA conversion.
+    // CopySubresourceRegion copies decoder's NV12 subresources into
+    // m_vpNv12Tex (same NV12 format — always compatible), then
+    // VideoProcessorBlt does the hardware color-space conversion
+    // into m_vpBgraTex, which is rendered via the standard BGRA shader.
+    ID3D11Texture2D* m_vpNv12Tex = nullptr;
+    ID3D11VideoDevice* m_videoDevice = nullptr;
+    ID3D11VideoContext* m_videoContext = nullptr;
+    ID3D11VideoProcessor* m_videoProcessor = nullptr;
+    ID3D11VideoProcessorEnumerator* m_vpEnumerator = nullptr;
+    ID3D11VideoProcessorInputView* m_vpInputView = nullptr;
+    ID3D11VideoProcessorOutputView* m_vpOutputView = nullptr;
+    ID3D11Texture2D* m_vpBgraTex = nullptr;
+    ID3D11ShaderResourceView* m_vpBgraSRV = nullptr;
+    uint32_t m_vpWidth = 0;
+    uint32_t m_vpHeight = 0;
 
     uint32_t m_textureWidth = 0;
     uint32_t m_textureHeight = 0;

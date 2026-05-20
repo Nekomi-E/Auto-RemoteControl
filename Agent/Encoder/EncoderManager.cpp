@@ -190,7 +190,7 @@ void EncoderManager::SubmitVideoFrame(std::vector<uint8_t> rawData,
     m_impl->videoInputQueue.tryPush(std::move(rf));
 }
 
-void EncoderManager::SubmitVideoFrameGpu(ID3D11Texture2D* gpuTexture,
+bool EncoderManager::SubmitVideoFrameGpu(ID3D11Texture2D* gpuTexture,
                                          uint32_t width, uint32_t height,
                                          int64_t timestampMs) {
     Impl::RawVideoFrame rf;
@@ -198,7 +198,7 @@ void EncoderManager::SubmitVideoFrameGpu(ID3D11Texture2D* gpuTexture,
     rf.width = width;
     rf.height = height;
     rf.timestampMs = timestampMs;
-    m_impl->videoInputQueue.tryPush(std::move(rf));
+    return m_impl->videoInputQueue.tryPush(std::move(rf));
 }
 
 void EncoderManager::SubmitAudioFrame(const std::vector<uint8_t>& rawData,

@@ -4,7 +4,10 @@
 #include "Common/Utils/Logger.h"
 #include "Common/Utils/Timer.h"
 #include <d3d11.h>
+#include <d3d10.h>       // ID3D10Multithread
 #include <dxgi1_2.h>
+
+#pragma comment(lib, "dxguid.lib")  // IID_ID3D10Multithread
 
 struct CaptureManager::Impl {
     std::unique_ptr<DxgiScreenCapture> screenCapture;
@@ -106,6 +109,18 @@ bool CaptureManager::Initialize(uint32_t targetFps) {
         }
     }
 
+    // Enable multithread protection — the same D3D11 immediate context is used
+    // from the encoder thread (CopyResource, VideoProcessorBlt, Flush) and the
+    // capture thread (CPU-fallback staging), so the driver must serialize access.
+    {
+        ID3D10Multithread* mt = nullptr;
+        if (SUCCEEDED(m_impl->d3dDevice->QueryInterface(IID_ID3D10Multithread, (void**)&mt))) {
+            mt->SetMultithreadProtected(TRUE);
+            mt->Release();
+            LOG_INFO("D3D11 multithread protection enabled (Agent)");
+        }
+    }
+
     // Init screen capture
     m_impl->screenCapture = std::make_unique<DxgiScreenCapture>();
     if (!m_impl->screenCapture->Initialize(m_impl->d3dDevice, m_impl->d3dContext)) {
@@ -168,7 +183,22 @@ bool CaptureManager::AcquireFrame(std::vector<uint8_t>& outData, uint32_t& width
 
 bool CaptureManager::AcquireFrameGpu(CapturedFrameGpu& outFrame) {
     if (!m_impl->running || !m_impl->screenCapture) return false;
-    return m_impl->screenCapture->AcquireFrameGpu(outFrame);
+
+    if (!m_impl->screenCapture->AcquireFrameGpu(outFrame))
+        return false;
+
+    m_impl->capturedFrames++;
+    m_impl->framesSinceLastStats++;
+
+    auto now = Timer::NowMs();
+    auto elapsed = now - m_impl->lastStatsTime;
+    if (elapsed >= 1000) {
+        m_impl->captureFps = m_impl->framesSinceLastStats * 1000.0f / elapsed;
+        m_impl->framesSinceLastStats = 0;
+        m_impl->lastStatsTime = now;
+    }
+
+    return true;
 }
 
 void CaptureManager::ReleaseGpuFrame() {

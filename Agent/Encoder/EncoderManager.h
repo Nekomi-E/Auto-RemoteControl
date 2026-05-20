@@ -37,7 +37,7 @@ public:
     void SubmitVideoFrame(std::vector<uint8_t> rawData,
                           uint32_t width, uint32_t height,
                           int64_t timestampMs);
-    void SubmitVideoFrameGpu(ID3D11Texture2D* gpuTexture,
+    bool SubmitVideoFrameGpu(ID3D11Texture2D* gpuTexture,
                              uint32_t width, uint32_t height,
                              int64_t timestampMs);
     void SubmitAudioFrame(const std::vector<uint8_t>& rawData, int64_t timestampMs);

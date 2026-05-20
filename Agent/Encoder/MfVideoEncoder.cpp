@@ -1112,7 +1112,9 @@ bool MfVideoEncoder::InitVideoProcessor(MfVideoEncoder::Impl* impl, uint32_t wid
     hr = impl->videoDevice->CreateVideoProcessor(impl->vpEnumerator, 0, &impl->videoProcessor);
     if (FAILED(hr)) return false;
 
-    // Create cached BGRA input texture (dynamic, CPU-writable for upload)
+    // Create cached BGRA input texture (DEFAULT — video processor input views
+    // cannot be created on DYNAMIC textures). CPU uploads use UpdateSubresource;
+    // GPU-to-GPU copies use CopySubresourceRegion.
     {
         D3D11_TEXTURE2D_DESC desc = {};
         desc.Width = width;
@@ -1121,9 +1123,8 @@ bool MfVideoEncoder::InitVideoProcessor(MfVideoEncoder::Impl* impl, uint32_t wid
         desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DYNAMIC;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
         hr = impl->d3dDevice->CreateTexture2D(&desc, nullptr, &impl->bgraGpuTex);
         if (FAILED(hr)) return false;
     }
@@ -1164,6 +1165,16 @@ bool MfVideoEncoder::InitVideoProcessor(MfVideoEncoder::Impl* impl, uint32_t wid
         if (FAILED(hr)) return false;
     }
 
+    // Set BT.601 limited-range color space so the VP produces NV12 that matches
+    // the Viewer's VP (which also uses BT.601 limited-range for decode).
+    {
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs = {};
+        cs.YCbCr_Matrix   = 0;  // BT.601
+        cs.Nominal_Range  = 1;  // 16-235 limited range (TV levels)
+        impl->videoContext->VideoProcessorSetStreamColorSpace(impl->videoProcessor, 0, &cs);
+        impl->videoContext->VideoProcessorSetOutputColorSpace(impl->videoProcessor, &cs);
+    }
+
     impl->vpWidth = width;
     impl->vpHeight = height;
     return true;
@@ -1183,20 +1194,10 @@ bool MfVideoEncoder::ConvertBgraToNv12Gpu(MfVideoEncoder::Impl* impl,
     if (!InitVideoProcessor(impl, width, height))
         return false;
 
-    // Upload BGRA data to GPU texture
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = impl->d3dContext->Map(impl->bgraGpuTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (FAILED(hr)) return false;
+    // Upload BGRA data to GPU texture via UpdateSubresource (DEFAULT texture can't be mapped)
+    impl->d3dContext->UpdateSubresource(impl->bgraGpuTex, 0, nullptr, bgraData, width * 4, 0);
 
-    size_t rowSize = width * 4;
-    if (mapped.RowPitch == rowSize) {
-        memcpy(mapped.pData, bgraData, rowSize * height);
-    } else {
-        for (uint32_t row = 0; row < height; ++row)
-            memcpy(static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch,
-                   bgraData + row * rowSize, rowSize);
-    }
-    impl->d3dContext->Unmap(impl->bgraGpuTex, 0);
+    HRESULT hr;
 
     // Set stream source rect to full frame
     RECT srcRect = { 0, 0, (LONG)width, (LONG)height };
@@ -1304,8 +1305,16 @@ bool MfVideoEncoder::ConvertTextureToNv12Gpu(Impl* impl, ID3D11Texture2D* bgraTe
     if (!InitVideoProcessor(impl, width, height))
         return false;
 
-    // Intra-GPU copy: captured BGRA texture → encoder's cached BGRA surface
-    impl->d3dContext->CopyResource(impl->bgraGpuTex, bgraTexture);
+    // Intra-GPU copy: captured BGRA texture → encoder's cached BGRA surface.
+    // Use CopySubresourceRegion (not CopyResource) because the DXGI capture
+    // texture may have different MipLevels/ArraySize than our texture.
+    {
+        D3D11_BOX box;
+        box.left = 0; box.top = 0; box.front = 0;
+        box.right = width; box.bottom = height; box.back = 1;
+        impl->d3dContext->CopySubresourceRegion(impl->bgraGpuTex, 0, 0, 0, 0,
+                                                 bgraTexture, 0, &box);
+    }
 
     // Set stream source rect to full frame
     RECT srcRect = { 0, 0, (LONG)width, (LONG)height };
@@ -1414,8 +1423,12 @@ bool MfVideoEncoder::EncodeFrameGpu(ID3D11Texture2D* bgraTexture,
         HRESULT hr = m_impl->mft->ProcessInput(0, sample, 0);
         sample->Release();
 
-        if (hr == MF_E_NOTACCEPTING)
-            return true; // encoder not ready, will retry next frame
+        if (hr == MF_E_NOTACCEPTING) {
+            // Encoder not ready — drain any pending output from a previous
+            // input, then return false so the caller doesn't push an empty frame.
+            ProcessOutput(outBitstream, outIsKeyFrame);
+            return false;
+        }
 
         if (SUCCEEDED(hr)) {
             if (ProcessOutput(outBitstream, outIsKeyFrame)) {
@@ -1425,8 +1438,13 @@ bool MfVideoEncoder::EncodeFrameGpu(ID3D11Texture2D* bgraTexture,
                     RequestKeyFrame();
                 return true;
             }
+            // ProcessInput accepted the frame but ProcessOutput needs more input
+            // before producing output (e.g. encoder lookahead). The frame data is
+            // already buffered in the MFT — do NOT fall through to CPU, which
+            // would double-feed the same frame.
+            return false;
         }
-        // GPU path failed at ProcessInput or ProcessOutput — fall through to CPU
+        // ProcessInput failed — fall through to CPU path below
     }
 
     // CPU fallback: read back BGRA texture and encode via CPU path.
@@ -1449,7 +1467,13 @@ bool MfVideoEncoder::EncodeFrameGpu(ID3D11Texture2D* bgraTexture,
     if (FAILED(m_impl->d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &stagingTex)))
         return false;
 
-    m_impl->d3dContext->CopyResource(stagingTex, bgraTexture);
+    {
+        D3D11_BOX box;
+        box.left = 0; box.top = 0; box.front = 0;
+        box.right = texDesc.Width; box.bottom = texDesc.Height; box.back = 1;
+        m_impl->d3dContext->CopySubresourceRegion(stagingTex, 0, 0, 0, 0,
+                                                    bgraTexture, 0, &box);
+    }
 
     D3D11_MAPPED_SUBRESOURCE mapped;
     bool cpuOk = false;
@@ -1509,7 +1533,7 @@ bool MfVideoEncoder::ProcessInput(const uint8_t* rawFrame, uint32_t width, uint3
             hr = m_impl->mft->ProcessInput(0, sample, 0);
             sample->Release();
             if (hr == MF_E_NOTACCEPTING)
-                return true; // encoder not ready, will retry next frame
+                return false; // encoder not ready, caller should retry
             if (SUCCEEDED(hr))
                 return true;
             // GPU path failed at ProcessInput — fall through to CPU path

@@ -216,6 +216,22 @@ bool MfVideoDecoder::InitializeWithD3D11(uint32_t codecType, uint32_t width, uin
     m_impl->deviceResetToken = token;
     m_impl->gpuDecodeAvailable = true;
     LOG_INFO("D3D11 device manager set on decoder — GPU decode path available");
+
+    // Re-send START_OF_STREAM so the MFT reinitializes with GPU memory.
+    // Initialize() already sent it before the D3D manager was available,
+    // which may cause the MFT to allocate a mix of system and GPU buffers
+    // — producing the 50/50 GPU/CPU decode split.
+    //
+    // Contract: MFT_MESSAGE_SET_D3D_MANAGER MUST precede START_OF_STREAM
+    // for the MFT to consistently produce GPU-backed output samples.
+    //
+    // Sequence: FLUSH clears any partially-allocated state from the
+    // earlier START_OF_STREAM, then we restart the stream with the
+    // D3D manager now in place.
+    m_impl->mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    LOG_INFO("Decoder restarted with D3D11 manager (flush + START_OF_STREAM)");
+
     return true;
 }
 
@@ -583,7 +599,6 @@ static bool DrainDecoderOutput(IMFTransform* mft, uint32_t& width, uint32_t& hei
 
         // If MFT provided the sample, use it
         if (!outSample) outSample = outputBuffer.pSample;
-        LOG_INFO("Drain: got frame from ProcessOutput");
 
         // Extract decoded data — use IMF2DBuffer to get real GPU stride
         BYTE* data = nullptr;
@@ -874,7 +889,13 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
         // If MFT provided the sample, use it
         if (!outSample) outSample = outputBuffer.pSample;
 
-        // Try to extract the GPU texture from the output buffer
+        // Try to extract the GPU texture from the output buffer.
+        // D3D11-aware hardware decoders may still produce non-GPU-backed output
+        // for some frames (driver-specific behaviour, DPB surface pool limits,
+        // or the MFT using system-memory fallback for certain frame types).
+        // We MUST drain every frame — silently dropping one causes the caller
+        // to re-feed the same input, producing the 50/50 GPU/CPU decode split.
+        bool gotBuffer = false;
         IMFMediaBuffer* buf = nullptr;
         if (SUCCEEDED(outputBuffer.pSample->GetBufferByIndex(0, &buf))) {
             // Check if this buffer wraps a DXGI surface (GPU-backed)
@@ -882,9 +903,8 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
             if (SUCCEEDED(buf->QueryInterface(IID_PPV_ARGS(&dxgiBuf)))) {
                 ID3D11Texture2D* tex = nullptr;
                 if (SUCCEEDED(dxgiBuf->GetResource(__uuidof(ID3D11Texture2D), (void**)&tex)) && tex) {
-                    // Release previous texture (drain loop returns last frame)
                     if (outNv12Texture) outNv12Texture->Release();
-                    outNv12Texture = tex; // already AddRef'd by GetResource
+                    outNv12Texture = tex;
                     outWidth = width;
                     outHeight = height;
                     if (!formatEstablished) {
@@ -893,11 +913,108 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
                     dxgiBuf->Release();
                     buf->Release();
                     outSample->Release();
-                    continue; // drain remaining frames
+                    continue;
                 }
                 dxgiBuf->Release();
             }
+
+            // Not GPU-backed — fall back to CPU extraction and GPU upload.
+            // This keeps the frame from being lost and prevents a double-feed.
+            IMF2DBuffer* buf2d = nullptr;
+            if (SUCCEEDED(buf->QueryInterface(IID_PPV_ARGS(&buf2d)))) {
+                BYTE* nv12Data = nullptr;
+                LONG nv12Stride = 0;
+                if (SUCCEEDED(buf2d->Lock2D(&nv12Data, &nv12Stride))) {
+                    D3D11_TEXTURE2D_DESC texDesc = {};
+                    texDesc.Width = width;
+                    texDesc.Height = height;
+                    texDesc.MipLevels = 1;
+                    texDesc.ArraySize = 1;
+                    texDesc.Format = DXGI_FORMAT_NV12;
+                    texDesc.SampleDesc.Count = 1;
+                    texDesc.Usage = D3D11_USAGE_DEFAULT;
+                    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+                    // Build contiguous upload buffer.
+                    // The decoded buffer may have padding (stride > width) so
+                    // we compact each row and pack Y + UV planes back-to-back.
+                    std::vector<uint8_t> compact(width * height * 3 / 2);
+                    uint8_t* yDst = compact.data();
+                    for (uint32_t row = 0; row < height; ++row) {
+                        memcpy(yDst, nv12Data + row * nv12Stride, width);
+                        yDst += width;
+                    }
+                    const BYTE* uvSrc = nv12Data + nv12Stride * height;
+                    for (uint32_t row = 0; row < height / 2; ++row) {
+                        memcpy(yDst, uvSrc + row * nv12Stride, width);
+                        yDst += width;
+                    }
+
+                    D3D11_SUBRESOURCE_DATA initData = {};
+                    initData.pSysMem = compact.data();
+                    initData.SysMemPitch = width;
+                    initData.SysMemSlicePitch = width * height;
+
+                    ID3D11Texture2D* uploadedTex = nullptr;
+                    if (SUCCEEDED(d3dDevice->CreateTexture2D(&texDesc, &initData, &uploadedTex))) {
+                        if (outNv12Texture) outNv12Texture->Release();
+                        outNv12Texture = uploadedTex;
+                        outWidth = width;
+                        outHeight = height;
+                        if (!formatEstablished) {
+                            HandleStreamChange(mft, width, height, yStride, subtype, formatEstablished);
+                        }
+                        static bool loggedOnce = false;
+                        if (!loggedOnce) {
+                            LOG_INFO("Decoder GPU drain: CPU-fallback upload %ux%u stride=%d",
+                                     width, height, nv12Stride);
+                            loggedOnce = true;
+                        }
+                        gotBuffer = true;
+                    }
+                    buf2d->Unlock2D();
+                }
+                buf2d->Release();
+            }
             buf->Release();
+        }
+
+        if (!gotBuffer) {
+            // Last resort: Lock contiguous buffer and upload
+            IMFMediaBuffer* rawBuf = nullptr;
+            if (SUCCEEDED(outSample->ConvertToContiguousBuffer(&rawBuf))) {
+                BYTE* data = nullptr;
+                DWORD maxLen = 0;
+                if (SUCCEEDED(rawBuf->Lock(&data, &maxLen, nullptr))) {
+                    D3D11_TEXTURE2D_DESC texDesc = {};
+                    texDesc.Width = width;
+                    texDesc.Height = height;
+                    texDesc.MipLevels = 1;
+                    texDesc.ArraySize = 1;
+                    texDesc.Format = DXGI_FORMAT_NV12;
+                    texDesc.SampleDesc.Count = 1;
+                    texDesc.Usage = D3D11_USAGE_DEFAULT;
+                    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+                    D3D11_SUBRESOURCE_DATA initData = {};
+                    initData.pSysMem = data;
+                    initData.SysMemPitch = width;
+                    initData.SysMemSlicePitch = width * height;
+
+                    ID3D11Texture2D* uploadedTex = nullptr;
+                    if (SUCCEEDED(d3dDevice->CreateTexture2D(&texDesc, &initData, &uploadedTex))) {
+                        if (outNv12Texture) outNv12Texture->Release();
+                        outNv12Texture = uploadedTex;
+                        outWidth = width;
+                        outHeight = height;
+                        if (!formatEstablished) {
+                            HandleStreamChange(mft, width, height, yStride, subtype, formatEstablished);
+                        }
+                    }
+                    rawBuf->Unlock();
+                }
+                rawBuf->Release();
+            }
         }
 
         outSample->Release();

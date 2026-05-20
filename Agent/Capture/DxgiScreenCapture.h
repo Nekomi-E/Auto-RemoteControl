@@ -39,6 +39,9 @@ private:
         IDXGIOutputDuplication* duplication = nullptr;
         MonitorDesc desc;
         ID3D11Texture2D* stagingTex = nullptr;
+        ID3D11Texture2D* sampleStagingTex = nullptr; // small staging for pixel differencing
+        std::vector<uint8_t> prevSample;             // previous frame's sample data
+        int duplicateCount = 0;                      // consecutive identical frames
         bool valid = false;
     };
 

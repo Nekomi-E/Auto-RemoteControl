@@ -102,6 +102,9 @@ bool DxgiScreenCapture::InitDuplicationForOutput(int outputIndex) {
         mc.duplication = nullptr;
     }
 
+    mc.duplicateCount = 0;
+    mc.prevSample.clear();
+
     hr = output1->DuplicateOutput(m_device, &mc.duplication);
     output1->Release();
 
@@ -118,6 +121,7 @@ void DxgiScreenCapture::Shutdown() {
     for (auto& mc : m_monitors) {
         if (mc.duplication) mc.duplication->Release();
         if (mc.stagingTex) mc.stagingTex->Release();
+        if (mc.sampleStagingTex) mc.sampleStagingTex->Release();
     }
     m_monitors.clear();
 }
@@ -198,6 +202,13 @@ bool DxgiScreenCapture::AcquireFromMonitor(int index, CapturedFrame& outFrame) {
         return false;
     }
 
+    // Skip duplicate frames (desktop unchanged since last capture)
+    if (frameInfo.AccumulatedFrames == 0) {
+        frameResource->Release();
+        mc.duplication->ReleaseFrame();
+        return false;
+    }
+
     // Get the D3D11 texture from the frame resource
     ID3D11Texture2D* srcTexture = nullptr;
     hr = frameResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&srcTexture);
@@ -235,8 +246,16 @@ bool DxgiScreenCapture::AcquireFromMonitor(int index, CapturedFrame& outFrame) {
         }
     }
 
-    // Copy from GPU texture to staging texture
-    m_context->CopyResource(mc.stagingTex, srcTexture);
+    // Copy from GPU texture to staging texture.
+    // Use CopySubresourceRegion (not CopyResource) because the DXGI capture
+    // texture may have different MipLevels/ArraySize than our staging texture.
+    {
+        D3D11_BOX box;
+        box.left = 0; box.top = 0; box.front = 0;
+        box.right = width; box.bottom = height; box.back = 1;
+        m_context->CopySubresourceRegion(mc.stagingTex, 0, 0, 0, 0,
+                                         srcTexture, 0, &box);
+    }
 
     // Map staging texture and read pixels
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -291,6 +310,16 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
     }
     if (FAILED(hr)) return false;
 
+    // AccumulatedFrames == 0 means the desktop hasn't changed since the last
+    // successful AcquireNextFrame. Skip these duplicates — the encoder would
+    // just produce near-empty delta frames and the Viewer would render the
+    // same content at 60 fps, misleadingly inflating the reported frame rate.
+    if (frameInfo.AccumulatedFrames == 0) {
+        frameResource->Release();
+        mc.duplication->ReleaseFrame();
+        return false;
+    }
+
     ID3D11Texture2D* srcTexture = nullptr;
     hr = frameResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&srcTexture);
     frameResource->Release();
@@ -298,6 +327,82 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
     if (FAILED(hr)) {
         mc.duplication->ReleaseFrame();
         return false;
+    }
+
+    // Pixel differencing: sample a 64x64 block from the screen center and
+    // compare with the previous frame's sample. The DWM may present frames at
+    // 60fps even when pixel content hasn't changed (V-Sync composition, etc.).
+    // These produce encoder skip-blocks (300-400 bytes) that look like 60fps
+    // in logs but render as 1-2 FPS visually.
+    {
+        D3D11_TEXTURE2D_DESC srcDesc;
+        srcTexture->GetDesc(&srcDesc);
+
+        UINT sampleW = 64, sampleH = 64;
+        if (!mc.sampleStagingTex) {
+            D3D11_TEXTURE2D_DESC stagingDesc = {};
+            stagingDesc.Width = sampleW;
+            stagingDesc.Height = sampleH;
+            stagingDesc.MipLevels = 1;
+            stagingDesc.ArraySize = 1;
+            stagingDesc.Format = srcDesc.Format;
+            stagingDesc.SampleDesc.Count = 1;
+            stagingDesc.Usage = D3D11_USAGE_STAGING;
+            stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            stagingDesc.BindFlags = 0;
+            if (FAILED(m_device->CreateTexture2D(&stagingDesc, nullptr, &mc.sampleStagingTex))) {
+                mc.sampleStagingTex = nullptr;
+            }
+        }
+
+        if (mc.sampleStagingTex) {
+            UINT srcW = mc.desc.width, srcH = mc.desc.height;
+            D3D11_BOX box;
+            box.left   = (srcW > sampleW) ? (srcW - sampleW) / 2 : 0;
+            box.top    = (srcH > sampleH) ? (srcH - sampleH) / 2 : 0;
+            box.front  = 0;
+            box.right  = box.left + sampleW;
+            box.bottom = box.top + sampleH;
+            box.back   = 1;
+
+            m_context->CopySubresourceRegion(mc.sampleStagingTex, 0, 0, 0, 0,
+                                             srcTexture, 0, &box);
+
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            if (SUCCEEDED(m_context->Map(mc.sampleStagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+                size_t sampleSize = static_cast<size_t>(sampleW) * sampleH * 4;
+                bool identical = (mc.prevSample.size() == sampleSize);
+
+                if (identical) {
+                    for (UINT row = 0; row < sampleH && identical; ++row) {
+                        if (std::memcmp(static_cast<const uint8_t*>(mapped.pData) + row * mapped.RowPitch,
+                                       mc.prevSample.data() + row * sampleW * 4,
+                                       sampleW * 4) != 0) {
+                            identical = false;
+                        }
+                    }
+                }
+
+                if (!identical) {
+                    mc.prevSample.resize(sampleSize);
+                    for (UINT row = 0; row < sampleH; ++row) {
+                        std::memcpy(mc.prevSample.data() + row * sampleW * 4,
+                                   static_cast<const uint8_t*>(mapped.pData) + row * mapped.RowPitch,
+                                   sampleW * 4);
+                    }
+                    mc.duplicateCount = 0;
+                } else {
+                    mc.duplicateCount++;
+                }
+                m_context->Unmap(mc.sampleStagingTex, 0);
+
+                if (identical) {
+                    srcTexture->Release();
+                    mc.duplication->ReleaseFrame();
+                    return false;
+                }
+            }
+        }
     }
 
     // Return the GPU texture directly — caller MUST call ReleaseGpuFrame()
