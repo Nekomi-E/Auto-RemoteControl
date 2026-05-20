@@ -5,6 +5,12 @@
 #include <timeapi.h>
 
 int main(int argc, char* argv[]) {
+    // Immediate output so the console window shows content right away.
+    // Encoder probing can take 5-15 seconds and the window looks hung otherwise.
+    printf("\n=== RemoteControl Agent v1.0 ===\n");
+    printf("Initializing...\n\n");
+    fflush(stdout);
+
     timeBeginPeriod(1);  // 1ms timer resolution for precise Sleep at 60fps
     Logger::Instance().SetLevel(LogLevel::Debug);
 

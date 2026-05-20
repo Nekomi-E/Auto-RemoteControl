@@ -113,6 +113,51 @@ bool DxgiScreenCapture::InitDuplicationForOutput(int outputIndex) {
         return false;
     }
 
+    // Pre-allocate texture pool for safe copies.
+    // Per-frame CreateTexture2D at 2560x1600 (~16MB) causes 100-600ms GPU
+    // allocation stalls. A fixed pool eliminates that overhead entirely.
+    {
+        uint32_t pw = mc.desc.width;
+        uint32_t ph = mc.desc.height;
+        bool needRealloc = (mc.poolWidth != pw || mc.poolHeight != ph);
+
+        // Release old pool if dimensions changed (e.g. monitor resolution change)
+        if (needRealloc) {
+            for (int i = 0; i < kSafePoolSize; ++i) {
+                if (mc.safePool[i]) {
+                    mc.safePool[i]->Release();
+                    mc.safePool[i] = nullptr;
+                }
+            }
+        }
+
+        if (needRealloc || !mc.safePool[0]) {
+            D3D11_TEXTURE2D_DESC poolDesc = {};
+            poolDesc.Width = pw;
+            poolDesc.Height = ph;
+            poolDesc.MipLevels = 1;
+            poolDesc.ArraySize = 1;
+            poolDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            poolDesc.SampleDesc.Count = 1;
+            poolDesc.Usage = D3D11_USAGE_DEFAULT;
+            poolDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+            for (int i = 0; i < kSafePoolSize; ++i) {
+                if (!mc.safePool[i]) {
+                    HRESULT poolHr = m_device->CreateTexture2D(&poolDesc, nullptr, &mc.safePool[i]);
+                    if (FAILED(poolHr)) {
+                        LOG_WARNING("Safe pool tex[%d] creation failed: 0x%08X", i, poolHr);
+                    }
+                }
+            }
+            mc.poolWidth = pw;
+            mc.poolHeight = ph;
+            mc.poolIndex = 0;
+            LOG_INFO("Safe texture pool allocated: %ux%u x%d (%.1f MB each)",
+                     pw, ph, kSafePoolSize, (pw * ph * 4.0) / (1024 * 1024));
+        }
+    }
+
     mc.valid = true;
     return true;
 }
@@ -122,6 +167,9 @@ void DxgiScreenCapture::Shutdown() {
         if (mc.duplication) mc.duplication->Release();
         if (mc.stagingTex) mc.stagingTex->Release();
         if (mc.sampleStagingTex) mc.sampleStagingTex->Release();
+        for (int i = 0; i < kSafePoolSize; ++i) {
+            if (mc.safePool[i]) mc.safePool[i]->Release();
+        }
     }
     m_monitors.clear();
 }
@@ -129,49 +177,51 @@ void DxgiScreenCapture::Shutdown() {
 bool DxgiScreenCapture::AcquireFrame(CapturedFrame& outFrame) {
     if (m_monitors.empty()) return false;
 
-    // Pace to target framerate — sleep only the remaining budget so capture
-    // runs as close to the target rate as possible without busy-waiting.
+    // Pace to target framerate — ensures consistent inter-frame spacing.
     auto now = Timer::NowMs();
     int64_t frameInterval = 1000 / m_targetFps;
     int64_t elapsed = now - m_lastFrameTime;
     if (elapsed < frameInterval) {
         Sleep(static_cast<DWORD>(frameInterval - elapsed));
-        now = Timer::NowMs();
     }
 
-    // Capture primary monitor only (monitor 0)
-    // Multi-monitor composition would require stitching frames before encoding
     if (AcquireFromMonitor(0, outFrame)) {
-        m_lastFrameTime = now;
-        outFrame.timestampMs = now;
+        m_lastFrameTime = Timer::NowMs();
+        outFrame.timestampMs = m_lastFrameTime;
         return true;
     }
+    m_lastFrameTime = Timer::NowMs();
     return false;
 }
 
 bool DxgiScreenCapture::AcquireFrameGpu(CapturedFrameGpu& outFrame) {
     if (m_monitors.empty()) return false;
 
+    // Pace to target framerate — ensures consistent inter-frame spacing so the
+    // encoder always has its full frame budget (16.67ms at 60fps). Without this,
+    // frames can arrive in bursts that overflow the encoder queue.
     auto now = Timer::NowMs();
     int64_t frameInterval = 1000 / m_targetFps;
     int64_t elapsed = now - m_lastFrameTime;
     if (elapsed < frameInterval) {
         Sleep(static_cast<DWORD>(frameInterval - elapsed));
-        now = Timer::NowMs();
     }
 
     if (AcquireFromMonitorGpu(0, outFrame)) {
-        m_lastFrameTime = now;
-        outFrame.timestampMs = now;
+        m_lastFrameTime = Timer::NowMs();
+        outFrame.timestampMs = m_lastFrameTime;
         return true;
     }
+    // Update timer on miss to avoid tight-looping after static periods.
+    // Without this, elapsed grows unbounded, pacing is skipped, and the
+    // capture thread burns CPU in a polling loop.
+    m_lastFrameTime = Timer::NowMs();
     return false;
 }
 
 void DxgiScreenCapture::ReleaseGpuFrame() {
-    if (!m_monitors.empty() && m_monitors[0].duplication) {
-        m_monitors[0].duplication->ReleaseFrame();
-    }
+    // DXGI frame is already released inside AcquireFromMonitorGpu
+    // after the safe copy. This is a no-op kept for API compatibility.
 }
 
 bool DxgiScreenCapture::AcquireFromMonitor(int index, CapturedFrame& outFrame) {
@@ -180,30 +230,28 @@ bool DxgiScreenCapture::AcquireFromMonitor(int index, CapturedFrame& outFrame) {
 
     IDXGIResource* frameResource = nullptr;
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
-    HRESULT hr = DXGI_ERROR_WAIT_TIMEOUT;
 
-    // Retry a few times with a 1ms wait — at 60fps (16.67ms interval)
-    // the desktop may not have a fresh frame exactly when we ask.
-    for (int retry = 0; retry < 3; ++retry) {
-        hr = mc.duplication->AcquireNextFrame(0, &frameInfo, &frameResource);
-        if (hr != DXGI_ERROR_WAIT_TIMEOUT) break;
-        if (retry < 2) Sleep(1);
-    }
+    HRESULT hr = mc.duplication->AcquireNextFrame(50, &frameInfo, &frameResource);
 
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        return false; // No new frame after retries, normal
-    }
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         LOG_WARNING("DXGI access lost on monitor %d, reinitializing", index);
         InitDuplicationForOutput(index);
         return false;
     }
-    if (FAILED(hr)) {
+    if (FAILED(hr)) return false;
+
+    // Skip duplicate frames: AccumulatedFrames==0 means the desktop hasn't
+    // presented since our last AcquireNextFrame (same physical frame).
+    if (frameInfo.AccumulatedFrames == 0) {
+        frameResource->Release();
+        mc.duplication->ReleaseFrame();
         return false;
     }
 
-    // Skip duplicate frames (desktop unchanged since last capture)
-    if (frameInfo.AccumulatedFrames == 0) {
+    // Fast path: zero metadata means no dirty/move rects reported by the OS.
+    // The frame is pixel-identical — skip the expensive GPU readback entirely.
+    if (frameInfo.TotalMetadataBufferSize == 0) {
         frameResource->Release();
         mc.duplication->ReleaseFrame();
         return false;
@@ -294,27 +342,42 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
 
     IDXGIResource* frameResource = nullptr;
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
-    HRESULT hr = DXGI_ERROR_WAIT_TIMEOUT;
 
-    for (int retry = 0; retry < 3; ++retry) {
-        hr = mc.duplication->AcquireNextFrame(0, &frameInfo, &frameResource);
-        if (hr != DXGI_ERROR_WAIT_TIMEOUT) break;
-        if (retry < 2) Sleep(1);
+    // Block up to 50ms for the next desktop frame. This replaces the old
+    // AcquireNextFrame(0) + 3×Sleep(1) retry loop, eliminating the tight
+    // polling that burned CPU and caused burst-gap capture patterns.
+    // A 50ms timeout gives ~20 checks/sec for m_running during static
+    // periods while naturally pacing to the DWM's VSync rate (60Hz =
+    // 16.67ms) when content is changing.
+    HRESULT hr = mc.duplication->AcquireNextFrame(50, &frameInfo, &frameResource);
+
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        static uint32_t timeoutLogCount = 0;
+        if ((timeoutLogCount++ & 0x3FF) == 0) {
+            LOG_INFO("[CaptureGpu] AcquireNextFrame timeout (count=%u)", timeoutLogCount);
+        }
+        return false;
     }
-
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         LOG_WARNING("DXGI access lost on monitor %d, reinitializing", index);
         InitDuplicationForOutput(index);
         return false;
     }
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        static uint32_t failLogCount = 0;
+        if ((failLogCount++ & 0x3F) == 0) {
+            LOG_WARNING("[CaptureGpu] AcquireNextFrame failed: 0x%08X (count=%u)", hr, failLogCount);
+        }
+        return false;
+    }
 
-    // AccumulatedFrames == 0 means the desktop hasn't changed since the last
-    // successful AcquireNextFrame. Skip these duplicates — the encoder would
-    // just produce near-empty delta frames and the Viewer would render the
-    // same content at 60 fps, misleadingly inflating the reported frame rate.
+    // Skip duplicate frames: AccumulatedFrames==0 means the desktop hasn't
+    // presented since our last AcquireNextFrame (same physical frame).
     if (frameInfo.AccumulatedFrames == 0) {
+        static uint32_t dupLogCount = 0;
+        if ((dupLogCount++ & 0x3FF) == 0) {
+            LOG_INFO("[CaptureGpu] AccumulatedFrames==0 (count=%u)", dupLogCount);
+        }
         frameResource->Release();
         mc.duplication->ReleaseFrame();
         return false;
@@ -332,8 +395,9 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
     // Pixel differencing: sample a 64x64 block from the screen center and
     // compare with the previous frame's sample. The DWM may present frames at
     // 60fps even when pixel content hasn't changed (V-Sync composition, etc.).
-    // These produce encoder skip-blocks (300-400 bytes) that look like 60fps
-    // in logs but render as 1-2 FPS visually.
+    // Some GPU drivers report TotalMetadataBufferSize==0 for frames that
+    // actually changed — the sample-diff catches those hidden changes.
+    // Do this BEFORE the TotalMetadataBufferSize fast-path skip.
     {
         D3D11_TEXTURE2D_DESC srcDesc;
         srcTexture->GetDesc(&srcDesc);
@@ -397,6 +461,11 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
                 m_context->Unmap(mc.sampleStagingTex, 0);
 
                 if (identical) {
+                    static uint32_t identLogCount = 0;
+                    if ((identLogCount++ & 0x3FF) == 0) {
+                        LOG_INFO("[CaptureGpu] pixel diff identical (count=%u dupCount=%u)",
+                                 identLogCount, mc.duplicateCount);
+                    }
                     srcTexture->Release();
                     mc.duplication->ReleaseFrame();
                     return false;
@@ -405,12 +474,33 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
         }
     }
 
-    // Return the GPU texture directly — caller MUST call ReleaseGpuFrame()
-    // after processing is complete, then Release() the texture.
-    outFrame.texture = srcTexture; // already AddRef'd by QueryInterface
+    // Copy the captured frame into a pre-allocated pool texture BEFORE
+    // calling ReleaseFrame. On some drivers ReleaseFrame may recycle the
+    // underlying surface; the pool texture guarantees the encoder always
+    // sees valid data regardless of when the encode thread processes it.
+    {
+        ID3D11Texture2D* safeTex = mc.safePool[mc.poolIndex];
+        if (safeTex) {
+            D3D11_BOX box;
+            box.left = 0; box.top = 0; box.front = 0;
+            box.right = mc.desc.width; box.bottom = mc.desc.height; box.back = 1;
+            m_context->CopySubresourceRegion(safeTex, 0, 0, 0, 0,
+                                             srcTexture, 0, &box);
+            safeTex->AddRef(); // caller takes ownership of this reference
+            outFrame.texture = safeTex;
+            mc.poolIndex = (mc.poolIndex + 1) % kSafePoolSize;
+        } else {
+            outFrame.texture = nullptr;
+        }
+    }
+
+    // Release the DXGI frame immediately so the next AcquireNextFrame can proceed.
+    srcTexture->Release();
+    mc.duplication->ReleaseFrame();
+
     outFrame.width  = mc.desc.width;
     outFrame.height = mc.desc.height;
-    return true;
+    return outFrame.texture != nullptr;
 }
 
 std::vector<MonitorDesc> DxgiScreenCapture::GetMonitors() const {

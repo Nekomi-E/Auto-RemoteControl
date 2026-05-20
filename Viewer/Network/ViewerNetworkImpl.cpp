@@ -94,6 +94,12 @@ bool ViewerNetworkImpl::Connect(const std::string& host, uint16_t port,
 }
 
 void ViewerNetworkImpl::Disconnect() {
+    if (m_secureChannel) {
+        LOG_INFO("[ViewerNet] Encryption stats: %llu decrypted, %llu auth failures",
+                 m_secureChannel->GetDecryptedCount(),
+                 m_secureChannel->GetAuthFailCount());
+    }
+
     m_connected = false;
 
     if (m_tcpSocket != INVALID_SOCKET) {

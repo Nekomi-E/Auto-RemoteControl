@@ -89,6 +89,11 @@ bool AgentNetworkImpl::Initialize(uint16_t port, const std::string& password, bo
 }
 
 void AgentNetworkImpl::Shutdown() {
+    if (m_secureChannel) {
+        LOG_INFO("[AgentNet] Encryption stats: %llu encrypted",
+                 m_secureChannel->GetEncryptedCount());
+    }
+
     m_connected = false;
     m_encrypted = false;
 

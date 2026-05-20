@@ -62,5 +62,7 @@ private:
     // Sequence numbers
     std::atomic<uint16_t> m_videoSeq{0};
     std::atomic<uint16_t> m_audioSeq{0};
+    std::atomic<uint32_t> m_videoSent{0};
+    std::atomic<uint32_t> m_audioSent{0};
     int64_t m_sessionStartMs = 0;
 };

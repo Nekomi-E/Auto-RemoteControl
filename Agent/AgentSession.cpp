@@ -176,9 +176,12 @@ void AgentSession::AcceptThread() {
 
 void AgentSession::CaptureThread() {
     LOG_INFO("[Capture] Thread started");
-    uint32_t frameCount = 0, failCount = 0, gpuCount = 0;
-    int64_t lastDebugSaveMs = 0;
-    uint32_t debugSaveCount = 0;
+    uint32_t frameCount = 0;
+    uint32_t dropCount = 0;
+    // Per-interval diagnostics
+    uint32_t intervalFrames = 0, intervalDrops = 0;
+    int64_t lastDiagTime = Timer::NowMs();
+    int64_t lastFrameMs = 0; // for inter-frame gap measurement
 
     while (m_running) {
         if (!m_clientConnected) {
@@ -186,62 +189,54 @@ void AgentSession::CaptureThread() {
             continue;
         }
 
-        // Try GPU capture path first (zero CPU readback)
         CapturedFrameGpu gpuFrame;
         if (m_captureMgr->AcquireFrameGpu(gpuFrame)) {
             frameCount++;
-            gpuCount++;
+            intervalFrames++;
             if (frameCount == 1) {
                 LOG_INFO("[Capture] First frame (GPU): %ux%u", gpuFrame.width, gpuFrame.height);
             }
             auto now = Timer::NowMs();
+
+            // Log inter-frame gap if unusually large (>33ms = <30fps)
+            if (lastFrameMs > 0) {
+                int64_t gap = now - lastFrameMs;
+                static uint32_t gapLogCount = 0;
+                if (gap > 33 && (gapLogCount++ & 0x1F) == 0) {
+                    LOG_WARNING("[Capture] inter-frame gap %lldms (%.1f fps equiv)", gap, 1000.0/gap);
+                }
+            }
+            lastFrameMs = now;
+
             bool submitted = m_encoderMgr->SubmitVideoFrameGpu(gpuFrame.texture,
                                                gpuFrame.width, gpuFrame.height, now);
             m_captureMgr->ReleaseGpuFrame();
             if (!submitted) {
-                // Queue full: encoder can't keep up. Release the texture we AddRef'd
-                // in AcquireFrameGpu, otherwise GPU memory leaks and causes crashes.
                 gpuFrame.texture->Release();
+                dropCount++;
+                intervalDrops++;
                 static uint32_t dropLogCount = 0;
                 if ((dropLogCount++ & 0x3F) == 0) {
-                    LOG_WARNING("[Capture] encoder queue full, dropping GPU frame");
+                    LOG_WARNING("[Capture] encoder queue full, dropping GPU frame (total drops=%u)", dropCount);
                 }
             }
             continue;
         }
 
-        // CPU fallback: read back from GPU and submit raw BGRA bytes
-        uint32_t width, height;
-        std::vector<uint8_t> frameData;
-        if (m_captureMgr->AcquireFrame(frameData, width, height)) {
-            frameCount++;
-            if (frameCount == 1) {
-                LOG_INFO("[Capture] First frame captured (CPU): %ux%u", width, height);
-            }
+        // No new/different frame available. Yield briefly.
+        Sleep(1);
 
-            // DEBUG: Save raw capture to BMP every ~5 seconds (up to 10)
-            auto now = Timer::NowMs();
-            if (debugSaveCount < 10 && (debugSaveCount == 0 || now - lastDebugSaveMs >= 5000)) {
-                lastDebugSaveMs = now;
-                debugSaveCount++;
-                std::vector<uint8_t> copyForSave = frameData;
-                std::thread([](std::vector<uint8_t> data, uint32_t w, uint32_t h, uint32_t cnt) {
-                    char prefix[64];
-                    snprintf(prefix, sizeof(prefix), "agent_capture_%u", cnt);
-                    SaveBmp(prefix, data.data(), w, h, true);
-                }, std::move(copyForSave), width, height, debugSaveCount).detach();
-            }
-
-            m_encoderMgr->SubmitVideoFrame(std::move(frameData), width, height, Timer::NowMs());
-        } else {
-            failCount++;
-            // No frame available — yield the CPU to avoid a tight busy-wait
-            // that starves the DWM compositor and reduces capture responsiveness.
-            Sleep(1);
+        // Per-interval diagnostics every 5 seconds
+        auto now = Timer::NowMs();
+        if (now - lastDiagTime >= 5000) {
+            LOG_INFO("[Capture] interval: %u captured, %u dropped, %u total",
+                     intervalFrames, intervalDrops, frameCount);
+            intervalFrames = 0;
+            intervalDrops = 0;
+            lastDiagTime = now;
         }
     }
-    LOG_INFO("[Capture] Thread stopped, %u frames (%u GPU, %u CPU), %u fails",
-             frameCount, gpuCount, frameCount - gpuCount, failCount);
+    LOG_INFO("[Capture] Thread stopped, %u frames, %u drops", frameCount, dropCount);
 }
 
 void AgentSession::VideoEncodeThread() {
@@ -355,6 +350,8 @@ void AgentSession::NetworkSendThread() {
         // Periodic stats
         auto now = Timer::NowMs();
         if (now - lastStatsTime >= 5000) {
+            m_videoSent.store(videoSent);
+            m_audioSent.store(audioSent);
             LOG_INFO("[NetworkSend] Sent: video=%u (fail=%u) audio=%u queue=%zu",
                      videoSent, videoFail, audioSent, m_videoSendQueue.size());
             lastStatsTime = now;
@@ -377,6 +374,7 @@ void AgentSession::InputInjectThread() {
 
 void AgentSession::StatsThread() {
     LOG_INFO("[Stats] Thread started");
+    uint32_t lastVideoSent = 0, lastAudioSent = 0;
 
     while (m_running) {
         Sleep(5000); // Log stats every 5 seconds
@@ -384,10 +382,19 @@ void AgentSession::StatsThread() {
         auto capStats = m_captureMgr ? m_captureMgr->GetStats() : CaptureManager::Stats{};
         auto encStats = m_encoderMgr ? m_encoderMgr->GetStats() : EncoderManager::Stats{};
 
-        LOG_INFO("[Stats] Capture: %.1f fps, Encode: %.1f fps, "
-                 "Bitrate: %.1f Mbps, Queue: video=%zu audio=%zu",
-                 capStats.captureFps, encStats.encodeFps,
+        uint32_t videoSentNow = m_videoSent.load();
+        uint32_t audioSentNow = m_audioSent.load();
+        float sendFps = (videoSentNow - lastVideoSent) / 5.0f;
+
+        LOG_INFO("[Stats] Capture: %.1f fps | Encode: %.1f fps | Send: %.1f fps | "
+                 "Bitrate: %.1f Mbps | Queue: vq=%zu aq=%zu | "
+                 "Total: cap=%u enc=%u sent=%u",
+                 capStats.captureFps, encStats.encodeFps, sendFps,
                  encStats.currentBitrate / 1000000.0,
-                 m_videoSendQueue.size(), m_audioSendQueue.size());
+                 m_videoSendQueue.size(), m_audioSendQueue.size(),
+                 capStats.capturedFrames, encStats.encodedFrames, videoSentNow);
+
+        lastVideoSent = videoSentNow;
+        lastAudioSent = audioSentNow;
     }
 }

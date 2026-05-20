@@ -247,7 +247,7 @@ bool MfVideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
     bool configured = false;
 
     if (width > 1920 || height > 1080) {
-        LOG_INFO("Target resolution %ux%u > 1080p, trying HEVC encoders first...",
+        LOG_INFO("Target resolution %ux%u > 1080p, searching HEVC encoders (may take several seconds)...",
                  width, height);
 
         // --- Try HEVC hardware encoders ---
@@ -954,7 +954,7 @@ bool MfVideoEncoder::EncodeFrame(const uint8_t* rawFrame, uint32_t width, uint32
     }
 
     // Force a keyframe periodically or on request
-    if (m_impl->needKeyFrame || (m_impl->frameIndex % 120 == 0)) {
+    if (m_impl->needKeyFrame || (m_impl->frameIndex % 30 == 0)) {
         RequestKeyFrame();
     }
 
@@ -1165,14 +1165,17 @@ bool MfVideoEncoder::InitVideoProcessor(MfVideoEncoder::Impl* impl, uint32_t wid
         if (FAILED(hr)) return false;
     }
 
-    // Set BT.601 limited-range color space so the VP produces NV12 that matches
-    // the Viewer's VP (which also uses BT.601 limited-range for decode).
+    // Set color space: input BGRA is full-range sRGB (0-255) from DXGI capture,
+    // output NV12 uses BT.601 limited range (TV levels, 16-235) for Y.
     {
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs = {};
-        cs.YCbCr_Matrix   = 0;  // BT.601
-        cs.Nominal_Range  = 1;  // 16-235 limited range (TV levels)
-        impl->videoContext->VideoProcessorSetStreamColorSpace(impl->videoProcessor, 0, &cs);
-        impl->videoContext->VideoProcessorSetOutputColorSpace(impl->videoProcessor, &cs);
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCS = {};
+        inCS.YCbCr_Matrix   = 0;  // BT.601 (ignored for RGB input)
+        inCS.Nominal_Range  = 0;  // 0-255 full range (sRGB from DXGI)
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE outCS = {};
+        outCS.YCbCr_Matrix  = 0;  // BT.601
+        outCS.Nominal_Range = 1;  // 16-235 limited range (TV levels for NV12)
+        impl->videoContext->VideoProcessorSetStreamColorSpace(impl->videoProcessor, 0, &inCS);
+        impl->videoContext->VideoProcessorSetOutputColorSpace(impl->videoProcessor, &outCS);
     }
 
     impl->vpWidth = width;
@@ -1434,7 +1437,7 @@ bool MfVideoEncoder::EncodeFrameGpu(ID3D11Texture2D* bgraTexture,
             if (ProcessOutput(outBitstream, outIsKeyFrame)) {
                 m_impl->frameIndex++;
                 if (outIsKeyFrame) m_impl->needKeyFrame = false;
-                if (m_impl->needKeyFrame || (m_impl->frameIndex % 120 == 0))
+                if (m_impl->needKeyFrame || (m_impl->frameIndex % 30 == 0))
                     RequestKeyFrame();
                 return true;
             }
