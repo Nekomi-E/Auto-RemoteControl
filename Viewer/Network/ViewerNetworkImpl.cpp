@@ -305,7 +305,10 @@ std::optional<Protocol::ControlMessage> ViewerNetworkImpl::ReceiveControlMessage
     if (m_tcpSocket == INVALID_SOCKET) return std::nullopt;
 
     DWORD tv = static_cast<DWORD>(timeoutMs);
-    setsockopt(m_tcpSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    if (static_cast<int>(tv) != m_lastTcpTimeout) {
+        setsockopt(m_tcpSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        m_lastTcpTimeout = static_cast<int>(tv);
+    }
 
     uint8_t lenBuf[4];
     int received = recv(m_tcpSocket, (char*)lenBuf, 4, MSG_WAITALL);
@@ -382,15 +385,16 @@ bool ViewerNetworkImpl::ReceiveDataFrame(DataPacket& outPacket, int timeoutMs) {
             buf.firstSeen = Timer::NowMs();
         }
 
-        if (fragHdr.fragmentIndex < buf.totalFrags && buf.chunks[fragHdr.fragmentIndex].empty()) {
+        if (fragHdr.fragmentIndex < buf.totalFrags && buf.totalFrags <= 32 &&
+            buf.chunks[fragHdr.fragmentIndex].empty()) {
             buf.chunks[fragHdr.fragmentIndex].assign(chunkData, chunkData + chunkSize);
             buf.receivedMask |= (1u << fragHdr.fragmentIndex);
             buf.totalSize += static_cast<uint32_t>(chunkSize);
         }
 
         // Check if all fragments received
-        uint16_t allMask = (buf.totalFrags < 16) ? ((1u << buf.totalFrags) - 1) : 0xFFFF;
-        if (buf.receivedMask == allMask) {
+        uint32_t allMask = (buf.totalFrags < 32) ? ((1u << buf.totalFrags) - 1) : 0xFFFFFFFF;
+        if (buf.totalFrags > 0 && buf.receivedMask == allMask) {
             // Reassemble
             std::vector<uint8_t> reassembled;
             reassembled.reserve(buf.totalSize);
@@ -408,17 +412,27 @@ bool ViewerNetworkImpl::ReceiveDataFrame(DataPacket& outPacket, int timeoutMs) {
         return false; // Waiting for more fragments
     }
 
-    // Clean up stale fragments periodically
+    // Clean up stale fragments periodically (5s timeout instead of 30s).
+    // Also evict oldest entries if the map grows beyond 64 to bound memory.
     auto fragNow = Timer::NowMs();
     if (fragNow - m_lastFragCleanup > 5000) {
         m_lastFragCleanup = fragNow;
         auto it = m_fragments.begin();
         while (it != m_fragments.end()) {
-            if (fragNow - it->second.firstSeen > 30000) {
+            if (fragNow - it->second.firstSeen > 5000) {
                 it = m_fragments.erase(it);
             } else {
                 ++it;
             }
+        }
+        // Hard cap: evict oldest entries if still too many
+        while (m_fragments.size() > 64) {
+            auto oldest = m_fragments.begin();
+            for (auto mit = m_fragments.begin(); mit != m_fragments.end(); ++mit) {
+                if (mit->second.firstSeen < oldest->second.firstSeen)
+                    oldest = mit;
+            }
+            m_fragments.erase(oldest);
         }
     }
 

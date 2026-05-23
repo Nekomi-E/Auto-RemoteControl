@@ -315,10 +315,10 @@ void ViewerSession::RenderThread() {
             lastDecodedCount = decodedNow;
             lastFpsUpdateTime = now;
 
-            // Smooth the render target to avoid oscillation when decode rate varies
-            if (m_renderTargetFps == 60.0f && instantFps > 0.0f) {
-                m_renderTargetFps = instantFps;
-            } else if (instantFps > 0.0f) {
+            // Smooth the render target to avoid oscillation when decode rate varies.
+            // Use EWMA from the start — jumping directly to instantFps on first
+            // measurement would latch onto a transient low value at startup.
+            if (instantFps > 0.0f) {
                 m_renderTargetFps = m_renderTargetFps * 0.7f + instantFps * 0.3f;
             }
             if (m_renderTargetFps < 10.0f) m_renderTargetFps = 10.0f;

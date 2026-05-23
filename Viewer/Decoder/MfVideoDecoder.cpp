@@ -589,7 +589,7 @@ static bool DrainDecoderOutput(IMFTransform* mft, uint32_t& width, uint32_t& hei
         if (FAILED(hr)) {
             if (outSample) outSample->Release();
             else if (outputBuffer.pSample) outputBuffer.pSample->Release();
-            if (failCount < 5) {
+            if (failCount < 5 || failCount % 100 == 0) {
                 LOG_WARNING("Decoder ProcessOutput failed: 0x%08X status=%u (input=%zu bytes)",
                             hr, status, inputLen);
                 failCount++;
@@ -764,7 +764,7 @@ bool MfVideoDecoder::DecodeFrame(const uint8_t* bitstream, size_t len,
     }
 
     if (FAILED(hr)) {
-        if (failCount < 5) {
+        if (failCount < 5 || failCount % 100 == 0) {
             LOG_WARNING("Decoder ProcessInput failed: 0x%08X (input=%zu bytes)", hr, len);
             failCount++;
         }
@@ -883,7 +883,7 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
         if (FAILED(hr)) {
             if (outSample) outSample->Release();
             else if (outputBuffer.pSample) outputBuffer.pSample->Release();
-            if (failCount < 5) {
+            if (failCount < 5 || failCount % 100 == 0) {
                 LOG_WARNING("Decoder ProcessOutput failed (GPU): 0x%08X status=%u", hr, status);
                 failCount++;
             }
@@ -1099,7 +1099,7 @@ bool MfVideoDecoder::DecodeFrameGpu(const uint8_t* bitstream, size_t len,
     }
 
     if (FAILED(hr)) {
-        if (failCount < 5) {
+        if (failCount < 5 || failCount % 100 == 0) {
             LOG_WARNING("Decoder ProcessInput failed (GPU): 0x%08X", hr);
             failCount++;
         }

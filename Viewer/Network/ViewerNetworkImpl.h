@@ -61,11 +61,12 @@ private:
     // Fragment reassembly
     struct FragBuf {
         uint16_t totalFrags = 0;
-        uint16_t receivedMask = 0;  // bitmask for up to 16 fragments
+        uint32_t receivedMask = 0;  // bitmask for up to 32 fragments
         std::vector<std::vector<uint8_t>> chunks;
         int64_t firstSeen = 0;
         uint32_t totalSize = 0;
     };
     std::unordered_map<uint16_t, FragBuf> m_fragments;
     int64_t m_lastFragCleanup = 0;
+    int m_lastTcpTimeout = -1;  // cache to avoid setsockopt per call
 };

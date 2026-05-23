@@ -31,6 +31,7 @@ bool MfAudioDecoder::Initialize() {
                             &inputInfo, &outputInfo, &activates, &count);
     if (FAILED(hr) || count == 0) {
         LOG_WARNING("No AAC decoder found (MFTEnumEx returned hr=0x%08X, count=%u)", hr, count);
+        if (activates) CoTaskMemFree(activates);
         return false;
     } else {
         hr = activates[0]->ActivateObject(IID_PPV_ARGS(&m_impl->mft));

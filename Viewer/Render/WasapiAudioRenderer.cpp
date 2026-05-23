@@ -111,10 +111,12 @@ bool WasapiAudioRenderer::Play(const std::vector<uint8_t>& pcmData) {
         size_t space = Impl::RingSize - ((m_impl->writePos - m_impl->readPos + Impl::RingSize) % Impl::RingSize);
         if (space < pcmData.size() + m_impl->frameSize) return false; // Buffer nearly full
 
-        for (size_t i = 0; i < pcmData.size(); ++i) {
-            m_impl->ringBuffer[m_impl->writePos] = pcmData[i];
-            m_impl->writePos = (m_impl->writePos + 1) % Impl::RingSize;
+        size_t firstPart = (std::min)(pcmData.size(), Impl::RingSize - m_impl->writePos);
+        memcpy(&m_impl->ringBuffer[m_impl->writePos], pcmData.data(), firstPart);
+        if (firstPart < pcmData.size()) {
+            memcpy(&m_impl->ringBuffer[0], pcmData.data() + firstPart, pcmData.size() - firstPart);
         }
+        m_impl->writePos = (m_impl->writePos + pcmData.size()) % Impl::RingSize;
     }
 
     // Check if WASAPI needs more data
@@ -122,7 +124,7 @@ bool WasapiAudioRenderer::Play(const std::vector<uint8_t>& pcmData) {
     m_impl->audioClient->GetCurrentPadding(&padding);
 
     UINT32 available = m_impl->bufferFrames - padding;
-    if (available < m_impl->bufferFrames / 4) return true; // Not enough room yet
+    if (available < m_impl->bufferFrames / 8) return true; // Not enough room yet
 
     // Write available data to WASAPI buffer
     std::lock_guard lock(m_impl->bufferMutex);
@@ -136,10 +138,12 @@ bool WasapiAudioRenderer::Play(const std::vector<uint8_t>& pcmData) {
     HRESULT hr = m_impl->renderClient->GetBuffer(framesToWrite, &dest);
     if (SUCCEEDED(hr) && dest) {
         UINT32 bytesToWrite = framesToWrite * m_impl->frameSize;
-        for (UINT32 i = 0; i < bytesToWrite; ++i) {
-            dest[i] = m_impl->ringBuffer[m_impl->readPos];
-            m_impl->readPos = (m_impl->readPos + 1) % Impl::RingSize;
+        size_t firstPart = (std::min)(static_cast<size_t>(bytesToWrite), Impl::RingSize - m_impl->readPos);
+        memcpy(dest, &m_impl->ringBuffer[m_impl->readPos], firstPart);
+        if (firstPart < bytesToWrite) {
+            memcpy(dest + firstPart, &m_impl->ringBuffer[0], bytesToWrite - firstPart);
         }
+        m_impl->readPos = (m_impl->readPos + bytesToWrite) % Impl::RingSize;
         m_impl->renderClient->ReleaseBuffer(framesToWrite, 0);
     }
 

@@ -626,7 +626,7 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
         // Output BGRA uses full range (0-255) — the swap chain back buffer is sRGB full range.
         {
             D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCS = {};
-            inCS.YCbCr_Matrix   = 0;  // BT.601
+            inCS.YCbCr_Matrix   = 1;  // BT.709 (matches encoder output)
             inCS.Nominal_Range  = 1;  // 16-235 limited range (TV levels)
             D3D11_VIDEO_PROCESSOR_COLOR_SPACE outCS = {};
             outCS.YCbCr_Matrix  = 0;  // BT.601 (ignored for RGB output)
@@ -665,7 +665,7 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
     {
         D3D11_BOX srcBox;
         srcBox.left = 0; srcBox.top = 0; srcBox.front = 0;
-        srcBox.right = width / 2; srcBox.bottom = height / 2; srcBox.back = 1;
+        srcBox.right = (width + 1) / 2; srcBox.bottom = (height + 1) / 2; srcBox.back = 1;
         m_context->CopySubresourceRegion(m_vpNv12Tex, 1, 0, 0, 0,
                                          nv12Texture, 1, &srcBox);
     }
@@ -696,9 +696,10 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
         return;
     }
 
-    // Flush the GPU pipeline so m_vpBgraTex is fully written before the Draw
-    // samples it via the SRV. Matches the encoder's pattern.
-    m_context->Flush();
+    // No explicit Flush() here — the D3D11 immediate context already tracks
+    // resource dependencies. The Draw call that samples m_vpBgraTex via its
+    // SRV will implicitly wait for the VideoProcessorBlt to complete.
+    // Calling Flush() would serialize CPU/GPU and cut throughput in half.
 
     // One-time validation: read back a small block of the VP BGRA output to
     // verify it contains non-black pixels. This catches misconfigured color
