@@ -3,4 +3,5 @@ build/
 .claude/
 *.suo
 *.user
+*.md
 z_LOG_by_NEKOMI.xlsx
