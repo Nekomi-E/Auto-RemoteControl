@@ -41,14 +41,14 @@ private:
 
     // Queues
     struct VideoFrame {
-        std::vector<uint8_t> data;
+		std::vector<uint8_t> data;// Encoded video data (e.g. H.264 NAL units)
         bool isKeyFrame = false;
         uint32_t width = 0;
         uint32_t height = 0;
         int64_t timestampMs = 0;
     };
     struct AudioPacket {
-        std::vector<uint8_t> data;
+		std::vector<uint8_t> data;// Encoded audio data (e.g. AAC frames)
         int64_t timestampMs = 0;
     };
 

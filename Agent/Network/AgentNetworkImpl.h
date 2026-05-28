@@ -44,17 +44,17 @@ private:
     std::string m_password;
     bool m_enableEncryption = true;
 
-    SOCKET m_tcpListen = INVALID_SOCKET;
-    SOCKET m_tcpClient = INVALID_SOCKET;
-    SOCKET m_udpSocket = INVALID_SOCKET;
+    SOCKET m_tcpListen = INVALID_SOCKET;//监听套接字，接受新的TCP连接
+    SOCKET m_tcpClient = INVALID_SOCKET;//已连接的TCP套接字，实际上是accept函数返回的套接字，与客户端通信
+    SOCKET m_udpSocket = INVALID_SOCKET;//UDP无连接套接字，发送数据帧到客户端
     sockaddr_in m_udpDestAddr = {};
 
     std::unique_ptr<SecureChannel> m_secureChannel;
     std::unique_ptr<Authenticator> m_authenticator;
     std::unique_ptr<DiffieHellman> m_dh;
 
-    std::atomic<bool> m_connected{false};
-    std::atomic<bool> m_encrypted{false};
+    std::atomic<bool> m_connected{ false };//连接状态
+	std::atomic<bool> m_encrypted{ false };//是否启用加密
     std::mutex m_sendMutex; // TCP send serialization
 
     // Pre-allocated buffers to avoid per-frame heap allocations

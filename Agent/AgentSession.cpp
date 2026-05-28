@@ -42,7 +42,7 @@ bool AgentSession::Initialize(const AgentConfig& config) {
 
     // Start accept thread early so Viewer can connect while we initialize
     m_running = true;
-    m_threads.emplace_back(&AgentSession::AcceptThread, this);
+	m_threads.emplace_back(&AgentSession::AcceptThread, this);//将工作线程添加到线程池中，保证其生命周期与AgentSession对象一致
 
     // Initialize capture
     if (!m_captureMgr->Initialize(m_config.targetFps)) {
@@ -148,7 +148,8 @@ void AgentSession::AcceptThread() {
 
             // Process control messages while connected
             while (m_running && m_network->IsConnected()) {
-                auto msg = m_network->ReceiveControlMessage(100);
+				auto msg = m_network->ReceiveControlMessage(100);//100ms 线程在没有消息时也能及时响应停止信号，同时避免长时间阻塞在ReceiveControlMessage中无法处理其他事件（如网络 disconnect）。如果改成完全阻塞等待，可能会导致在Viewer断开连接或Agent停止时，AcceptThread无法及时退出。不过100ms的等待确实可能引入一些输入响应延迟，可以考虑更短的等待时间或者使用事件驱动的方式来通知线程有新消息。
+				//TODO 利用事件驱动的方式通知线程有新消息，避免轮询等待带来的输入响应延迟
                 if (msg) {
                     if (msg->type == Protocol::MessageType::INPUT_EVENT) {
                         for (auto& ev : msg->inputEvents) {

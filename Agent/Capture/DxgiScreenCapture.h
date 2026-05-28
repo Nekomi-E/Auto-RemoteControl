@@ -12,7 +12,7 @@ struct ID3D11Texture2D;
 class DxgiScreenCapture {
 public:
     struct CapturedFrame {
-        std::vector<uint8_t> data;
+        std::vector<uint8_t> data;//字节数组，按照BGRA格式存储逐行扫描的像素数据  每个像素占B,G,R,A四个字节
         uint32_t width = 0;
         uint32_t height = 0;
         int64_t timestampMs = 0;

@@ -44,7 +44,7 @@ bool CaptureManager::Initialize(uint32_t targetFps) {
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT
                | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
 #ifdef _DEBUG
-    flags |= D3D11_CREATE_DEVICE_DEBUG;
+    flags |= D3D11_CREATE_DEVICE_DEBUG;//启用D3D11调试层
 #endif
 
     D3D_FEATURE_LEVEL featureLevels[] = {

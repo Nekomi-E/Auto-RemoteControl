@@ -107,7 +107,7 @@ std::string SaveRawData(const std::string& prefix, const uint8_t* data, size_t l
     snprintf(ts, sizeof(ts), "%04d%02d%02d_%02d%02d%02d_%03d",
              st.wYear, st.wMonth, st.wDay,
              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    std::string path = dir + "debug_" + prefix + "_" + ts + ".bin";
+    std::string path = dir + "debug_" + prefix + "_" + ts + ".bin";//使用.bin文件保存原始数据
 
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) {

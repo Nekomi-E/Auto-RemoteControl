@@ -217,7 +217,7 @@ std::optional<ControlMessage> ControlMessage::fromJson(const std::string& json) 
     return msg;
 }
 
-std::vector<uint8_t> ControlMessage::serialize() const {
+std::vector<uint8_t> ControlMessage::serialize() const {//ControlMessage对象包含了多种类型的成员变量（如字符串、整数、可选值等），直接将其内存表示作为二进制数据进行传输和解析会非常复杂且容易出错。不同平台和编译器可能对内存布局有不同的处理方式，导致跨平台兼容性问题。而使用JSON格式作为序列化和反序列化的媒介，可以提供一种结构化、易于理解和调试的方式来表示ControlMessage对象的内容。JSON格式具有良好的可读性和广泛的支持，使得在网络通信中传输ControlMessage对象更加可靠和灵活。
     std::string json = toJson();
     std::vector<uint8_t> buf(4 + json.size());
     uint32_t len = static_cast<uint32_t>(json.size());
@@ -231,8 +231,10 @@ std::vector<uint8_t> ControlMessage::serialize() const {
 
 std::optional<ControlMessage> ControlMessage::deserialize(const uint8_t* data, size_t len) {
     if (len == 0) return std::nullopt;
-    std::string json(reinterpret_cast<const char*>(data), len);
-    return fromJson(json);
+    std::string json(reinterpret_cast<const char*>(data), len);//reinterpret_cast<const char*>将uint8_t*类型的数据指针转换为const char*类型的指针
+	//与 static_cast 不同，reinterpret_cast 可以进行更底层的类型转换，不受类型安全检查的限制。这里使用 reinterpret_cast 是因为我们需要将接收到的二进制数据（uint8_t*）解释为一个字符串（const char*），以便后续的 JSON 解析操作。
+	//而 static_cast 主要用于相关类型之间的转换，且会进行类型安全检查，不能用于完全不相关的类型之间的转换。在这种情况下，使用 static_cast 将无法编译通过，因为 uint8_t* 和 const char* 是两种不同的指针类型，没有直接的继承关系或兼容性。
+	return fromJson(json);
 }
 
 } // namespace Protocol

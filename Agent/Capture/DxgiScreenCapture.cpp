@@ -144,7 +144,7 @@ bool DxgiScreenCapture::InitDuplicationForOutput(int outputIndex) {
 
             for (int i = 0; i < kSafePoolSize; ++i) {
                 if (!mc.safePool[i]) {
-                    HRESULT poolHr = m_device->CreateTexture2D(&poolDesc, nullptr, &mc.safePool[i]);
+                    HRESULT poolHr = m_device->CreateTexture2D(&poolDesc, nullptr, &mc.safePool[i]);//创建2D纹理对象用于安全复制
                     if (FAILED(poolHr)) {
                         LOG_WARNING("Safe pool tex[%d] creation failed: 0x%08X", i, poolHr);
                     }

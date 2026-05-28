@@ -50,7 +50,7 @@ bool InputInjectorImpl::InjectMouseMove(int16_t dx, int16_t dy) {
     input.mi.dx = dx;
     input.mi.dy = dy;
 
-    return SendInput(1, &input, sizeof(INPUT)) == 1;
+	return SendInput(1, &input, sizeof(INPUT)) == 1;//SendInput函数将一个或多个输入事件插入到系统输入队列中，模拟用户输入。参数1表示输入事件的数量，参数2是指向INPUT结构体数组的指针，参数3是INPUT结构体的大小。函数返回值是成功插入的输入事件数量，如果返回值不等于1，说明插入失败。
 }
 
 bool InputInjectorImpl::InjectMouseButton(uint8_t button, bool down) {
