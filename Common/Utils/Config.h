@@ -11,6 +11,7 @@ struct AgentConfig {
     uint32_t audioBitrate = 64000;    // 64 kbps AAC
     bool enableEncryption = true;
     uint32_t videoQuality = 0;          // 0=auto, 1=balanced, 2=lossless ("原画")
+    bool variableFrameRate = false;     // VFR: capture at DXGI natural rate, no pacing
 };
 
 struct ViewerConfig {
@@ -20,6 +21,8 @@ struct ViewerConfig {
     bool enableAudio = true;
     bool enableEncryption = true;
     bool fullscreen = false;
+    uint32_t targetFps = 60;  // render target, 10–120
+    bool variableFrameRate = false;  // VFR: render at decode rate, no fixed pacing
 };
 
 class Config {

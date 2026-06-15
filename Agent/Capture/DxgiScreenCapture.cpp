@@ -6,6 +6,33 @@
 #include <dxgi.h>
 #include <cstdio>
 #include <cstring>
+#include <timeapi.h>
+
+#pragma comment(lib, "winmm.lib")
+
+// Precision sleep: uses timeBeginPeriod(1) to set the global timer resolution
+// to 1 ms, then spin-waits the last 2 ms with QueryPerformanceCounter so the
+// total wait is accurate to ~0.1 ms.  This replaces raw Sleep(), which has
+// default granularity of ~15.6 ms and, even after timeBeginPeriod(1), can
+// oversleep by 1–2 ms.
+static void PrecisionSleepMs(int64_t targetMs) {
+    if (targetMs <= 0) return;
+    if (targetMs > 2) {
+        // Bulk wait with Sleep, leaving a 2 ms margin for spin-finish
+        Sleep(static_cast<DWORD>(targetMs - 2));
+    }
+    // Spin-wait the remainder
+    LARGE_INTEGER freq, start;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    int64_t targetTicks = freq.QuadPart * targetMs / 1000;
+    for (;;) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - start.QuadPart >= targetTicks) break;
+        YieldProcessor(); // _mm_pause — avoids SMT contention
+    }
+}
 
 DxgiScreenCapture::DxgiScreenCapture() {}
 
@@ -66,6 +93,13 @@ bool DxgiScreenCapture::Initialize(ID3D11Device* device, ID3D11DeviceContext* co
         InitDuplicationForOutput(static_cast<int>(i));
     }
 
+    // Set the global Windows timer resolution to 1 ms so Sleep() and waitable
+    // timers run at sub-15.6 ms granularity.  Restored in Shutdown().
+    if (timeBeginPeriod(1) == TIMERR_NOERROR) {
+        m_timerResolutionSet = true;
+        LOG_INFO("Timer resolution set to 1 ms");
+    }
+
     LOG_INFO("DXGI screen capture initialized, %zu monitor(s)", m_monitors.size());
     return true;
 }
@@ -104,6 +138,25 @@ bool DxgiScreenCapture::InitDuplicationForOutput(int outputIndex) {
 
     mc.duplicateCount = 0;
     mc.prevSample.clear();
+
+    // Query monitor refresh rate for diagnostic logging.
+    // DXGI Desktop Duplication is capped at the display's VSync rate —
+    // even with --fps 120, a 60Hz monitor can only deliver 60fps.
+    {
+        DXGI_MODE_DESC modeHint = {};
+        modeHint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        modeHint.Width = mc.desc.width;
+        modeHint.Height = mc.desc.height;
+        DXGI_MODE_DESC closestMode = {};
+        if (SUCCEEDED(output->FindClosestMatchingMode(&modeHint, &closestMode, nullptr))) {
+            if (closestMode.RefreshRate.Denominator > 0) {
+                mc.refreshRate = static_cast<float>(closestMode.RefreshRate.Numerator)
+                               / static_cast<float>(closestMode.RefreshRate.Denominator);
+            }
+        }
+        LOG_INFO("Monitor %d: %ux%u @ %.1f Hz (VSync cap for DXGI capture)",
+                 outputIndex, mc.desc.width, mc.desc.height, mc.refreshRate);
+    }
 
     hr = output1->DuplicateOutput(m_device, &mc.duplication);//DXGI核心： 为每个监视器创建一个输出复制接口，允许捕获屏幕内容
     output1->Release();
@@ -163,6 +216,10 @@ bool DxgiScreenCapture::InitDuplicationForOutput(int outputIndex) {
 }
 
 void DxgiScreenCapture::Shutdown() {
+    if (m_timerResolutionSet) {
+        timeEndPeriod(1);
+        m_timerResolutionSet = false;
+    }
     for (auto& mc : m_monitors) {
         if (mc.duplication) mc.duplication->Release();
         if (mc.stagingTex) mc.stagingTex->Release();
@@ -182,7 +239,7 @@ bool DxgiScreenCapture::AcquireFrame(CapturedFrame& outFrame) {
     int64_t frameInterval = 1000 / m_targetFps;
     int64_t elapsed = now - m_lastFrameTime;
     if (elapsed < frameInterval) {
-        Sleep(static_cast<DWORD>(frameInterval - elapsed));
+        PrecisionSleepMs(frameInterval - elapsed);
     }
 
     if (AcquireFromMonitor(0, outFrame)) {
@@ -201,13 +258,31 @@ bool DxgiScreenCapture::AcquireFrameGpu(CapturedFrameGpu& outFrame) {
     // encoder always has its full frame budget (16.67ms at 60fps). Without this,
     // frames can arrive in bursts that overflow the encoder queue.
     auto now = Timer::NowMs();
-    int64_t frameInterval = 1000 / m_targetFps;//目标帧率的帧间隔时间(ms)
+    int64_t frameInterval = 1000 / m_targetFps;
     int64_t elapsed = now - m_lastFrameTime;
     if (elapsed < frameInterval) {
-		Sleep(static_cast<DWORD>(frameInterval - elapsed));// static_cast用于大多数类型转换，提供编译时类型检查，但不执行运行时检查。
-                                                           // dynamic_cast用于多态类型之间的安全转换，提供运行时类型检查，适用于类层次结构。
-                                                           // const_cast用于添加或移除对象的const或volatile属性，不改变对象的实际类型。
-                                                           // reinterpret_cast用于低级别的指针或整数之间的转换，不进行任何检查，可能导致不可移植或不安全的代码。
+        PrecisionSleepMs(frameInterval - elapsed);
+    }
+
+    // One-time diagnostic: warn if target FPS exceeds the monitor's actual
+    // refresh rate. DXGI Desktop Duplication is VSync-bound and cannot deliver
+    // frames faster than the display hardware.
+    {
+        static bool vsyncWarned = false;
+        if (!vsyncWarned && !m_monitors.empty()) {
+            vsyncWarned = true;
+            float monRefresh = m_monitors[0].refreshRate;
+            if (static_cast<float>(m_targetFps) > monRefresh + 1.0f) {
+                LOG_WARNING("[CaptureGpu] Target FPS (%u) exceeds monitor refresh rate (%.1f Hz). "
+                           "DXGI Desktop Duplication is VSync-bound — effective capture rate will be "
+                           "capped at the display's refresh rate (~%.1f fps). "
+                           "To achieve %u fps, use a monitor with >=%u Hz refresh rate.",
+                           m_targetFps, monRefresh, monRefresh, m_targetFps, m_targetFps);
+            } else {
+                LOG_INFO("[CaptureGpu] Target FPS: %u, Monitor refresh: %.1f Hz — VSync headroom OK",
+                         m_targetFps, monRefresh);
+            }
+        }
     }
 
     if (AcquireFromMonitorGpu(0, outFrame)) {
@@ -569,6 +644,11 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
             // caught above by comparing poolDesc.Format to srcDesc.Format.
             m_context->CopySubresourceRegion(safeTex, 0, 0, 0, 0,
                                              srcTexture, 0, &box);
+            // Flush immediately so the GPU starts the copy before the encoder
+            // thread submits its own GPU work (VideoProcessorBlt) on the same
+            // immediate context.  This reduces pipeline serialisation between
+            // the capture and encode threads at high frame rates.
+            m_context->Flush();
             safeTex->AddRef(); // caller takes ownership of this reference
             outFrame.texture = safeTex;
             mc.poolIndex = (mc.poolIndex + 1) % kSafePoolSize;

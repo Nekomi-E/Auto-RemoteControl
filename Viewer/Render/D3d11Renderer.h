@@ -67,8 +67,7 @@ private:
     ID3D11InputLayout* m_inputLayout = nullptr;
 
     // Video Processor pipeline for NV12→BGRA conversion.
-    // CopySubresourceRegion copies decoder's NV12 subresources into
-    // m_vpNv12Tex (same NV12 format — always compatible), then
+    // Decoder's NV12 texture is copied into m_vpNv12Tex, then
     // VideoProcessorBlt does the hardware color-space conversion
     // into m_vpBgraTex, which is rendered via the standard BGRA shader.
     ID3D11Texture2D* m_vpNv12Tex = nullptr;

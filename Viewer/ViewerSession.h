@@ -25,6 +25,7 @@ public:
     void OnKeyEvent(UINT msg, WPARAM wParam, LPARAM lParam);
     void OnMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam);
     void OnRawInput(HRAWINPUT hRawInput);
+    void SetInputActive(bool active) { m_inputActive = active; }
 
     bool SetRenderWindow(HWND hwnd);
     uint32_t GetRemoteWidth() const { return m_remoteWidth; }
@@ -69,7 +70,7 @@ private:
         uint32_t height = 0;
     };
 
-    ThreadSafeQueue<VideoPacket> m_videoQueue{64};
+    ThreadSafeQueue<VideoPacket> m_videoQueue{96};
     ThreadSafeQueue<AudioPacket> m_audioQueue{128};
     ThreadSafeQueue<Protocol::InputEvent> m_inputSendQueue{64};
 
@@ -77,10 +78,23 @@ private:
     std::mutex m_frameMutex;
     DecodedFrame m_latestFrame;
 
-    // Decoded frame rate tracking (actual video FPS, not render/packet rate)
+    // Condition variable signalled by the decode thread when a new frame is
+    // ready.  The render thread blocks on this CV instead of busy-spinning
+    // at the target FPS when no new decoded frames are available.
+    std::condition_variable m_frameCv;
+
+    // Frame freshness tracking — the decode thread bumps m_decodedFrameId
+    // on each successful decode and notifies m_frameCv; the render thread
+    // only presents when m_decodedFrameId > m_lastRenderedFrameId, avoiding
+    // redundant GPU work and breaking the EWMA→queue-buildup→drop feedback loop.
+    std::atomic<uint32_t> m_decodedFrameId{0};
+    uint32_t m_lastRenderedFrameId = 0;
+
+    // Decoded FPS for overlay display (informational only, not used for pacing)
     std::atomic<uint32_t> m_decodedFrameCount{0};
-    float m_decodedFps = 0.0f;
-    float m_renderTargetFps = 60.0f;  // smoothed, updated each second
+    float m_displayFps = 0.0f;
+    float m_targetRenderFps = 60.0f;
+    bool m_variableFrameRate = false;   // VFR: render at decode rate, no fixed pacing
 
     // Resize synchronization (main thread → render thread)
     std::mutex m_renderMutex;
@@ -98,4 +112,5 @@ private:
     uint32_t m_windowWidth = 0;
     uint32_t m_windowHeight = 0;
     std::atomic<bool> m_inputActive{false};
+    bool m_timerResolutionSet = false;
 };

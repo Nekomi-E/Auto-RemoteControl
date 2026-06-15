@@ -9,7 +9,7 @@ if "%AGENT_PASS%"=="" set AGENT_PASS=test123
 set AGENT_QUALITY=%3
 if "%AGENT_QUALITY%"=="" set AGENT_QUALITY=2
 set AGENT_FPS=%4
-if "%AGENT_FPS%"=="" set AGENT_FPS=60
+if "%AGENT_FPS%"=="" set AGENT_FPS=120
 
 set AGENT_EXE=build\Agent\Debug\Agent.exe
 if not exist "%AGENT_EXE%" set AGENT_EXE=build\Agent\Release\Agent.exe

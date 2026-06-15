@@ -10,7 +10,30 @@
 #include "Common/Utils/Timer.h"
 #include "Common/Utils/DebugScreenshot.h"
 #include <d3d11.h>
+#include <algorithm>
 #include <thread>
+#include <timeapi.h>
+
+#pragma comment(lib, "winmm.lib")
+
+// Precision sleep with spin-finish — see Agent/Capture/DxgiScreenCapture.cpp
+// for the rationale.  Used by the render thread instead of raw Sleep().
+static void PrecisionSleepMs(int64_t targetMs) {
+    if (targetMs <= 0) return;
+    if (targetMs > 2) {
+        Sleep(static_cast<DWORD>(targetMs - 2));
+    }
+    LARGE_INTEGER freq, start;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    int64_t targetTicks = freq.QuadPart * targetMs / 1000;
+    for (;;) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - start.QuadPart >= targetTicks) break;
+        YieldProcessor();
+    }
+}
 
 ViewerSession::ViewerSession() {}
 
@@ -65,6 +88,18 @@ bool ViewerSession::Initialize(const ViewerConfig& config) {
     LOG_INFO("Viewer session initialized, remote screen: %ux%u codec: %s",
              m_remoteWidth, m_remoteHeight,
              codecType == 1 ? "HEVC" : "H.264");
+
+    // Clamp and store the render FPS from config
+    m_targetRenderFps = static_cast<float>(
+        (std::max)(10u, (std::min)(m_config.targetFps, 120u)));
+    m_variableFrameRate = m_config.variableFrameRate;
+
+    // Set global timer resolution for precision pacing
+    if (timeBeginPeriod(1) == TIMERR_NOERROR) {
+        m_timerResolutionSet = true;
+        LOG_INFO("Viewer timer resolution set to 1 ms");
+    }
+
     return true;
 }
 
@@ -82,18 +117,15 @@ bool ViewerSession::SetRenderWindow(HWND hwnd) {
     }
     m_overlay->Initialize(hwnd, m_renderer->GetD2DDeviceContext());
 
-    // Enable GPU decode path if the decoder can use the renderer's D3D11 device
-    LOG_INFO("Checking GPU decode path: decoder=%p rendererDevice=%p rendererContext=%p",
-             (void*)m_videoDecoder.get(),
-             (void*)m_renderer->GetDevice(),
-             (void*)m_renderer->GetContext());
+    // Share the renderer's D3D11 device with the hardware decoder so decoded
+    // NV12 textures are directly accessible for VP conversion + rendering.
+    // This puts decode + VP + draw on the same GPU queue; at 2560×1600 the
+    // VP NV12→BGRA conversion takes ~10-15 ms on the laptop RTX 4080, which
+    // limits new-frame throughput to ~60-100 fps depending on content.
     if (m_videoDecoder && m_renderer->GetDevice()) {
         m_videoDecoder->InitializeWithD3D11(
             m_network->GetCodecType(), m_remoteWidth, m_remoteHeight,
             m_renderer->GetDevice(), m_renderer->GetContext());
-    } else {
-        LOG_INFO("GPU decode path skipped: decoder=%d device=%p",
-                 m_videoDecoder ? 1 : 0, (void*)m_renderer->GetDevice());
     }
 
     return true;
@@ -119,11 +151,17 @@ void ViewerSession::Stop() {
     m_videoQueue.close();
     m_audioQueue.close();
     m_inputSendQueue.close();
+    m_frameCv.notify_all();  // wake render thread from CV wait
 
     if (m_network) m_network->Disconnect();
 
     for (auto& t : m_threads) {
         if (t.joinable()) t.join();
+    }
+
+    if (m_timerResolutionSet) {
+        timeEndPeriod(1);
+        m_timerResolutionSet = false;
     }
 
     if (m_latestFrame.nv12Texture) {
@@ -167,7 +205,7 @@ void ViewerSession::RenderFrame() {
     }
 
     // Render overlay — show actual decoded video FPS, not network packet rate
-    m_overlay->Draw(m_decodedFps,
+    m_overlay->Draw(m_displayFps,
                     m_network ? m_network->IsConnected() : false);
 
     // Present
@@ -201,11 +239,19 @@ void ViewerSession::OnKeyEvent(UINT msg, WPARAM wParam, LPARAM lParam) {
     ke.extended = (HIWORD(lParam) & KF_EXTENDED) != 0;
     ev.key = ke;
 
+    static int keyCount = 0;
+    if (++keyCount <= 3) {
+        LOG_INFO("[Input] Key event: vk=0x%02X %s (active=%d)", ke.vkCode,
+                 isDown ? "down" : "up", m_inputActive.load());
+    }
+
     m_inputSendQueue.tryPush(ev);
 }
 
 void ViewerSession::OnMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam) {
     if (!m_inputActive || !m_network) return;
+
+    static int mouseCount = 0;
 
     Protocol::InputEvent ev;
     ev.timestamp = Timer::NowMs();
@@ -251,6 +297,9 @@ void ViewerSession::OnMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam) {
     default:
         return;
     }
+    if (++mouseCount <= 3) {
+        LOG_INFO("[Input] Mouse event: type=%d (active=%d)", (int)msg, m_inputActive.load());
+    }
     m_inputSendQueue.tryPush(ev);
 }
 
@@ -276,18 +325,45 @@ void ViewerSession::OnRawInput(HRAWINPUT hRawInput) {
                 static_cast<int16_t>(raw->data.mouse.lLastX),
                 static_cast<int16_t>(raw->data.mouse.lLastY)
             };
+            static int rawMoveCount = 0;
+            if (++rawMoveCount <= 3) {
+                LOG_INFO("[Input] RawInput mouse move: dx=%d dy=%d",
+                         (int)raw->data.mouse.lLastX, (int)raw->data.mouse.lLastY);
+            }
             m_inputSendQueue.tryPush(ev);
         }
     }
 }
 
 void ViewerSession::RenderThread() {
-    LOG_INFO("[Render] Thread started");
+    LOG_INFO("[Render] Thread started, target=%.1f fps", m_targetRenderFps);
     int64_t lastFrameTime = Timer::NowMs();
-    uint32_t frameCount = 0;
-    int64_t lastStatsTime = lastFrameTime;
     int64_t lastFpsUpdateTime = lastFrameTime;
     uint32_t lastDecodedCount = 0;
+    uint32_t renderCount = 0;
+    uint32_t skipCount = 0;
+    int64_t lastStatsTime = lastFrameTime;
+
+    // Fixed render pacing: always aims for m_targetRenderFps (from config),
+    // independent of instantaneous decode rate.  The render thread polls for
+    // a new frame (m_decodedFrameId > m_lastRenderedFrameId) and only issues
+    // GPU work when a fresh frame is available.
+    //
+    // This breaks the old EWMA negative-feedback loop:
+    //   decode slows → EWMA drops m_renderTargetFps → render slows →
+    //   decode queue fills → network drops → decode slows further.
+    // With fixed pacing, the decode/network path is never throttled by the
+    // render consumer; the queue drains freely and the network never sees
+    // artificial backpressure.
+    int64_t frameIntervalMs = static_cast<int64_t>(1000.0 / m_targetRenderFps);
+    bool vfr = m_variableFrameRate;
+    LOG_INFO("[Render] Thread started, target=%.1f fps  mode=%s",
+             m_targetRenderFps, vfr ? "VFR" : "CFR");
+
+    // CFR: always present at target FPS even when content is static.
+    //   New frame → render new.  No new frame → re-render last.
+    // VFR: only present when a new decoded frame arrives.
+    //   New frame → render new.  No new frame → CV wait (no GPU work).
 
     while (m_running) {
         // Check for pending resize from the main thread
@@ -301,45 +377,55 @@ void ViewerSession::RenderThread() {
             }
         }
 
-        RenderFrame();
-        frameCount++;
+        uint32_t currentDecodedId = m_decodedFrameId.load();
+        bool hasNewFrame = (currentDecodedId != m_lastRenderedFrameId);
+
+        if (hasNewFrame) {
+            // New decoded frame available — render it.
+            RenderFrame();
+            m_lastRenderedFrameId = currentDecodedId;
+            renderCount++;
+        } else if (!vfr) {
+            // CFR mode, no new frame — re-render the last frame to maintain
+            // the target display rate even when the remote desktop is static.
+            RenderFrame();
+            skipCount++;
+        } else {
+            // VFR mode, no new frame — block until one arrives.
+            skipCount++;
+            std::unique_lock cvLock(m_frameMutex);
+            m_frameCv.wait(cvLock, [this] {
+                return !m_running || m_decodedFrameId.load() != m_lastRenderedFrameId;
+            });
+        }
 
         auto now = Timer::NowMs();
 
-        // Update decoded FPS every second for smooth overlay display
+        // Update decoded FPS display once per second
         if (now - lastFpsUpdateTime >= 1000) {
             uint32_t decodedNow = m_decodedFrameCount.load();
-            float instantFps = static_cast<float>(
+            m_displayFps = static_cast<float>(
                 (decodedNow - lastDecodedCount) * 1000.0f / (now - lastFpsUpdateTime));
-            m_decodedFps = instantFps;
             lastDecodedCount = decodedNow;
             lastFpsUpdateTime = now;
+        }
 
-            // Smooth the render target to avoid oscillation when decode rate varies.
-            // Use EWMA from the start — jumping directly to instantFps on first
-            // measurement would latch onto a transient low value at startup.
-            if (instantFps > 0.0f) {
-                m_renderTargetFps = m_renderTargetFps * 0.7f + instantFps * 0.3f;
+        // CFR only: fixed-interval pacing
+        if (!vfr) {
+            int64_t elapsed = now - lastFrameTime;
+            if (elapsed < frameIntervalMs) {
+                PrecisionSleepMs(frameIntervalMs - elapsed);
             }
-            if (m_renderTargetFps < 10.0f) m_renderTargetFps = 10.0f;
-            if (m_renderTargetFps > 60.0f) m_renderTargetFps = 60.0f;
+            lastFrameTime = Timer::NowMs();
         }
 
-        // Pace to actual decode rate so each new frame gets one present,
-        // avoiding irregular frame duplication that causes visible stutter.
-        int64_t targetInterval = static_cast<int64_t>(1000.0f / m_renderTargetFps);
-        int64_t elapsed = now - lastFrameTime;
-        if (elapsed < targetInterval) {
-            Sleep(static_cast<DWORD>(targetInterval - elapsed));
-        }
-        lastFrameTime = Timer::NowMs();
-
-        // Periodic stats (5s interval) — more detailed log
+        // Periodic stats (5s interval)
         if (now - lastStatsTime >= 5000) {
-            double renderFps = frameCount * 1000.0 / (now - lastStatsTime);
-            LOG_INFO("[Render] render=%.1f fps  video=%.1f fps  frames=%u",
-                     renderFps, m_decodedFps, frameCount);
-            frameCount = 0;
+            double renderFps = (renderCount + skipCount) * 1000.0 / (now - lastStatsTime);
+            LOG_INFO("[Render] render=%.1f fps  video=%.1f fps  renders=%u skips=%u  mode=%s",
+                     renderFps, m_displayFps, renderCount, skipCount, vfr ? "VFR" : "CFR");
+            renderCount = 0;
+            skipCount = 0;
             lastStatsTime = now;
         }
     }
@@ -353,9 +439,10 @@ void ViewerSession::NetworkReceiveThread() {
     uint32_t debugSaveCount = 0;
 
     while (m_running) {
-        // Receive data frame
+        // Receive data frame — 5ms timeout matches 120fps frame interval (~8ms)
+        // to ensure timely reception without excessive CPU polling.
         ViewerNetworkImpl::DataPacket packet;
-        if (m_network->ReceiveDataFrame(packet, 10)) {
+        if (m_network->ReceiveDataFrame(packet, 5)) {
             totalPackets++;
             if (packet.type == Protocol::FrameType::VIDEO_KEYFRAME ||
                 packet.type == Protocol::FrameType::VIDEO_DELTA) {
@@ -424,12 +511,8 @@ void ViewerSession::VideoDecodeThread() {
         }
 
         if (m_videoDecoder->HasGpuPath()) {
-            // GPU path: DecodeFrameGpu feeds the data and drains ALL output.
-            // DrainDecoderOutputGpu handles both GPU-backed and system-memory
-            // buffers internally (CPU→GPU upload fallback). The MFT consumes
-            // the input in ProcessInput — do NOT call DecodeFrame afterwards
-            // (that would double-feed the same bitstream, causing the 50/50
-            // GPU/CPU decode split when the MFT surface pool alternates).
+            // GPU decode: MFT outputs NV12 GPU texture on the shared device.
+            // The render thread does VP NV12→BGRA conversion and draw.
             ID3D11Texture2D* nv12Tex = nullptr;
             uint32_t width = 0, height = 0;
             if (m_videoDecoder->DecodeFrameGpu(vp->data.data(), vp->data.size(),
@@ -443,6 +526,8 @@ void ViewerSession::VideoDecodeThread() {
                 frames++;
                 gpuFrames++;
                 m_decodedFrameCount++;
+                m_decodedFrameId.fetch_add(1);
+                m_frameCv.notify_one();
                 if (frames == 1) {
                     LOG_INFO("[VideoDecode] First frame decoded (GPU): %ux%u (key=%d input=%zu bytes)",
                              width, height, vp->isKeyFrame, vp->data.size());
@@ -465,6 +550,8 @@ void ViewerSession::VideoDecodeThread() {
                 m_latestFrame.height = height;
                 frames++;
                 m_decodedFrameCount++;
+                m_decodedFrameId.fetch_add(1);
+                m_frameCv.notify_one();  // wake render thread
                 if (frames == 1) {
                     LOG_INFO("[VideoDecode] First frame decoded (CPU): %ux%u (key=%d input=%zu bytes)",
                              width, height, vp->isKeyFrame, vp->data.size());
@@ -515,14 +602,20 @@ void ViewerSession::AudioDecodeThread() {
 void ViewerSession::InputSendThread() {
     LOG_INFO("[InputSend] Thread started");
 
+    uint32_t sentCount = 0;
     while (m_running) {
         auto ev = m_inputSendQueue.tryPop(20);
         if (ev && m_network) {
             Protocol::ControlMessage msg;
             msg.type = Protocol::MessageType::INPUT_EVENT;
             msg.inputEvents.push_back(*ev);
-            m_network->SendControlMessage(msg);
+            if (m_network->SendControlMessage(msg)) {
+                sentCount++;
+                if (sentCount <= 3) {
+                    LOG_INFO("[InputSend] Sent input event type=%d", (int)ev->type);
+                }
+            }
         }
     }
-    LOG_INFO("[InputSend] Thread stopped");
+    LOG_INFO("[InputSend] Thread stopped, %u sent", sentCount);
 }

@@ -5,10 +5,11 @@ setlocal
 
 :: ============================================================
 ::  Viewer 快速启动脚本（主控端）
-::  用法: start_viewer.bat [host] [port] [password]
+::  用法: start_viewer.bat [host] [port] [password] [fps]
 ::    host     - Agent 地址 (默认: 127.0.0.1)
 ::    port     - Agent 端口 (默认: 27016)
 ::    password - 连接密码 (默认: test123)
+::    fps      - 目标渲染帧率 (默认: 120)
 :: ============================================================
 
 set VIEWER_HOST=%1
@@ -17,6 +18,8 @@ set VIEWER_PORT=%2
 if "%VIEWER_PORT%"=="" set VIEWER_PORT=27016
 set VIEWER_PASS=%3
 if "%VIEWER_PASS%"=="" set VIEWER_PASS=test123
+set VIEWER_FPS=%4
+if "%VIEWER_FPS%"=="" set VIEWER_FPS=120
 
 set VIEWER_EXE=build\Viewer\Debug\Viewer.exe
 if not exist "%VIEWER_EXE%" set VIEWER_EXE=build\Viewer\Release\Viewer.exe
@@ -34,7 +37,7 @@ timeout /t 1 /nobreak >nul
 
 echo [INFO] Starting Viewer connecting to %VIEWER_HOST%:%VIEWER_PORT%...
 echo.
-"%VIEWER_EXE%" --host %VIEWER_HOST% --port %VIEWER_PORT% --password "%VIEWER_PASS%"
+"%VIEWER_EXE%" --host %VIEWER_HOST% --port %VIEWER_PORT% --password "%VIEWER_PASS%" --fps %VIEWER_FPS%
 
 pause
 endlocal

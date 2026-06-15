@@ -84,6 +84,10 @@ bool AgentSession::Initialize(const AgentConfig& config) {
     m_network->SetScreenInfo(actualEncWidth, actualEncHeight);
     m_network->SetCodecType(codecType);
 
+    // Bypass the internal encoder output queue — encoded frames go directly to
+    // m_videoSendQueue, eliminating the VideoEncodeThread relay hop.
+    m_encoderMgr->SetDirectVideoOutputQueue(&m_videoSendQueue);
+
     LOG_INFO("  Encoder resolution: %ux%u (monitor: %ux%u)",
              actualEncWidth, actualEncHeight, encWidth, encHeight);
 
@@ -103,7 +107,9 @@ void AgentSession::Run() {
 
     // Accept thread was started in Initialize() already
     m_threads.emplace_back(&AgentSession::CaptureThread, this);
-    m_threads.emplace_back(&AgentSession::VideoEncodeThread, this);
+    // VideoEncodeThread removed — EncoderManager now writes directly to
+    // m_videoSendQueue via SetDirectVideoOutputQueue, eliminating the
+    // redundant relay thread and queue hop.
     m_threads.emplace_back(&AgentSession::NetworkSendThread, this);
     m_threads.emplace_back(&AgentSession::InputInjectThread, this);
     m_threads.emplace_back(&AgentSession::StatsThread, this);
@@ -176,13 +182,20 @@ void AgentSession::AcceptThread() {
 }
 
 void AgentSession::CaptureThread() {
-    LOG_INFO("[Capture] Thread started");
+    LOG_INFO("[Capture] Thread started%s", m_config.variableFrameRate ? " (VFR mode)" : "");
     uint32_t frameCount = 0;
     uint32_t dropCount = 0;
     // Per-interval diagnostics
     uint32_t intervalFrames = 0, intervalDrops = 0;
     int64_t lastDiagTime = Timer::NowMs();
     int64_t lastFrameMs = 0; // for inter-frame gap measurement
+
+    if (m_config.variableFrameRate) {
+        // VFR mode: disable capture pacing — poll DXGI at its natural rate.
+        // Setting targetFps to a high value bypasses the pacing sleep in
+        // AcquireFrameGpu while keeping the 50ms AcquireNextFrame timeout.
+        m_captureMgr->SetTargetFps(500);
+    }
 
     while (m_running) {
         if (!m_clientConnected) {
@@ -224,8 +237,12 @@ void AgentSession::CaptureThread() {
             continue;
         }
 
-        // No new/different frame available. Yield briefly.
-        Sleep(1);
+        // No new/different frame available (desktop is static or DXGI returned
+        // a duplicate).  AcquireFrameGpu already has a 50ms internal timeout
+        // on AcquireNextFrame, so we only reach here when the desktop is truly
+        // idle.  A 2ms yield is sufficient — shorter than the pacing interval
+        // (8ms @ 120fps) but long enough to avoid busy-spinning.
+        Sleep(2);
 
         // Per-interval diagnostics every 5 seconds
         auto now = Timer::NowMs();
@@ -238,42 +255,6 @@ void AgentSession::CaptureThread() {
         }
     }
     LOG_INFO("[Capture] Thread stopped, %u frames, %u drops", frameCount, dropCount);
-}
-
-void AgentSession::VideoEncodeThread() {
-    LOG_INFO("[VideoEncode] Thread started");
-    uint32_t frameCount = 0;
-    uint32_t debugSaveCount = 0;
-
-    while (m_running) {
-        EncoderManager::EncodedFrame encFrame;
-        if (m_encoderMgr->GetEncodedVideoFrame(encFrame, 50)) {
-            size_t encSize = encFrame.data.size();
-            auto encWidth = encFrame.width;
-            auto encHeight = encFrame.height;
-            auto encKey = encFrame.isKeyFrame;
-
-            // DEBUG: Save first 5 encoded H.264 bitstreams (before move)
-            if (debugSaveCount < 5 && encSize > 0) {
-                SaveRawData("agent_encoded", encFrame.data.data(), encSize);
-                debugSaveCount++;
-            }
-
-            VideoFrame vf;
-            vf.data = std::move(encFrame.data);
-            vf.isKeyFrame = encKey;
-            vf.width = encWidth;
-            vf.height = encHeight;
-            vf.timestampMs = encFrame.timestampMs;
-            m_videoSendQueue.tryPush(std::move(vf));
-            frameCount++;
-            if (frameCount == 1) {
-                LOG_INFO("[VideoEncode] First encoded frame: %ux%u key=%d size=%zu",
-                         encWidth, encHeight, encKey, encSize);
-            }
-        }
-    }
-    LOG_INFO("[VideoEncode] Thread stopped, %u frames", frameCount);
 }
 
 void AgentSession::AudioCaptureThread() {
@@ -315,7 +296,9 @@ void AgentSession::NetworkSendThread() {
 
     while (m_running) {
         // Send video frames (higher priority)
-        auto vf = m_videoSendQueue.tryPop(2);
+        // Receives EncodedFrame directly from EncoderManager (via direct output queue),
+        // eliminating the former VideoEncodeThread relay hop.
+        auto vf = m_videoSendQueue.tryPop(10);
         if (vf) {
             Protocol::FrameType type = vf->isKeyFrame
                 ? Protocol::FrameType::VIDEO_KEYFRAME
@@ -338,7 +321,7 @@ void AgentSession::NetworkSendThread() {
         }
 
         // Send audio frames
-        auto af = m_audioSendQueue.tryPop(1);
+        auto af = m_audioSendQueue.tryPop(5);
         if (af) {
             uint16_t seq = m_audioSeq.fetch_add(1);
             if (m_network->SendDataFrame(Protocol::FrameType::AUDIO_FRAME, seq,
@@ -364,13 +347,19 @@ void AgentSession::NetworkSendThread() {
 void AgentSession::InputInjectThread() {
     LOG_INFO("[InputInject] Thread started");
 
+    uint32_t injectedCount = 0;
     while (m_running) {
         auto ev = m_inputQueue.tryPop(50);
         if (ev) {
-            m_inputInjector->Inject(*ev);
+            bool ok = m_inputInjector->Inject(*ev);
+            injectedCount++;
+            if (injectedCount <= 5) {
+                LOG_INFO("[InputInject] Injected event type=%d result=%d",
+                         (int)ev->type, ok ? 1 : 0);
+            }
         }
     }
-    LOG_INFO("[InputInject] Thread stopped");
+    LOG_INFO("[InputInject] Thread stopped, %u injected", injectedCount);
 }
 
 void AgentSession::StatsThread() {

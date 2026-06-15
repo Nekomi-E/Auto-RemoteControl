@@ -27,12 +27,17 @@ struct EncoderManager::Impl {
         int64_t timestampMs = 0;
     };
 
-    ThreadSafeQueue<RawVideoFrame> videoInputQueue{24};
+    ThreadSafeQueue<RawVideoFrame> videoInputQueue{48};  // ~400ms @ 120fps
     ThreadSafeQueue<RawAudioFrame> audioInputQueue{16};
 
     // Encoded output queues
-    ThreadSafeQueue<EncodedFrame> videoOutputQueue{48};//视频编码可能产生较大延迟，允许更多待发送帧积压
+    ThreadSafeQueue<EncodedFrame> videoOutputQueue{96};//视频编码可能产生较大延迟，允许更多待发送帧积压
     ThreadSafeQueue<EncodedFrame> audioOutputQueue{32};
+
+    // Direct output queue — when set, the encode thread bypasses videoOutputQueue
+    // and pushes encoded frames directly to this queue, eliminating the
+    // AgentSession::VideoEncodeThread relay hop.
+    ThreadSafeQueue<EncodedFrame>* directVideoOutputQueue = nullptr;
 
     // Worker threads
     std::thread videoEncodeThread;
@@ -95,7 +100,9 @@ bool EncoderManager::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
     // Start encode workers
     m_impl->videoEncodeThread = std::thread([this]() {
         while (m_impl->running) {
-            auto frame = m_impl->videoInputQueue.tryPop(5);
+            // 20ms timeout — MFTs have internal buffers; polling at 5ms just
+            // wastes CPU and causes lock contention on the input queue mutex.
+            auto frame = m_impl->videoInputQueue.tryPop(20);
             if (frame) {
                 std::vector<uint8_t> bitstream;
                 bool isKeyFrame = false;
@@ -121,7 +128,15 @@ bool EncoderManager::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
                     ef.width = frame->width;
                     ef.height = frame->height;
                     ef.timestampMs = frame->timestampMs;
-                    m_impl->videoOutputQueue.tryPush(std::move(ef));
+
+                    // Push to the direct output queue if set (bypasses the
+                    // internal videoOutputQueue + AgentSession::VideoEncodeThread
+                    // relay, saving one thread-hop and one queue).
+                    if (m_impl->directVideoOutputQueue) {
+                        m_impl->directVideoOutputQueue->tryPush(std::move(ef));
+                    } else {
+                        m_impl->videoOutputQueue.tryPush(std::move(ef));
+                    }
 
                     m_impl->encodedFrames++;
                     if (isKeyFrame) m_impl->keyFrames++;
@@ -177,6 +192,13 @@ void EncoderManager::Stop() {
 
     if (m_impl->videoEncoder) m_impl->videoEncoder->Shutdown();
     if (m_impl->audioEncoder) m_impl->audioEncoder->Shutdown();
+}
+
+void EncoderManager::SetDirectVideoOutputQueue(ThreadSafeQueue<EncodedFrame>* queue) {
+    m_impl->directVideoOutputQueue = queue;
+    if (queue) {
+        LOG_INFO("EncoderManager: direct video output queue set — bypassing internal relay");
+    }
 }
 
 void EncoderManager::SubmitVideoFrame(std::vector<uint8_t> rawData,

@@ -49,6 +49,7 @@ struct MfVideoEncoder::Impl {
 
     // Cached buffers to avoid per-frame heap allocations
     std::vector<uint8_t> nv12Buffer;       // reusable NV12 conversion buffer (~6 MB)
+    std::vector<uint8_t> cpuFallbackBuf;   // reusable CPU fallback BGRA buffer (~16 MB)
     ID3D11Texture2D* gpuTexture = nullptr; // cached GPU encoder input texture
     uint32_t gpuTexWidth = 0;
     uint32_t gpuTexHeight = 0;
@@ -833,11 +834,34 @@ void MfVideoEncoder::FinalizeMediaTypes(uint32_t resW, uint32_t resH) {
                  resW, resH, m_impl->fps, m_impl->bitrate);
     }
 
-    // Enable low latency mode
+    // --- Ultra-low-latency encoder tuning ---
+    // Each property is set independently; failures are ignored since not all
+    // MFTs (especially software encoders) support every control.
     IMFAttributes* attrs = nullptr;
     hr = m_impl->mft->GetAttributes(&attrs);
     if (SUCCEEDED(hr)) {
+        // 1. Low-latency mode: hints the encoder to minimise internal buffering.
+        //    Hardware encoders (NVENC, QSV, AMF) honour this; software fallbacks
+        //    may ignore it.
         attrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
+
+        // 2. Real-time mode: tells the encoder that frames arrive at a fixed
+        //    cadence (no lookahead / scene-analysis pass). This eliminates the
+        //    1–3 frame pipeline delay that MFTs otherwise add for rate-control
+        //    convergence.
+        attrs->SetUINT32(CODECAPI_AVEncCommonRealTime, TRUE);
+
+        // 3. Quality-vs-speed: 0 = pure speed. Disables expensive motion-
+        //    estimation refinements and RDO passes that add frame pipeline depth.
+        attrs->SetUINT32(CODECAPI_AVEncCommonQualityVsSpeed, 0);
+
+        // 4. GOP size = 1 keyframe per second (scaled to FPS).  The default
+        //    GOP is often 60–250 frames (1–4 s), which means the decoder must
+        //    buffer up to 4 s before the first picture can be output.
+        //    One keyframe per second caps decode-start delay at ~1 s while
+        //    preserving reasonable P-frame compression efficiency.
+        attrs->SetUINT32(CODECAPI_AVEncMPVGOPSize, m_impl->fps);
+
         attrs->Release();
     }
 
@@ -876,14 +900,14 @@ static void BgraToNv12(const uint8_t* bgra, uint32_t width, uint32_t height,
             const uint8_t* src = bgra + (row * width + col) * 4;
             uint8_t b = src[0], g = src[1], r = src[2];
 
-            // BT.601 YUV conversion
-            uint8_t y = static_cast<uint8_t>((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            // BT.709 YUV conversion (matches GPU Video Processor output)
+            uint8_t y = static_cast<uint8_t>((54 * r + 183 * g + 18 * b + 128) >> 8) + 16;
             yPlane[row * width + col] = y;
 
             // Downsampled UV (4:2:0)
             if (row % 2 == 0 && col % 2 == 0) {
-                uint8_t u = static_cast<uint8_t>((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                uint8_t v = static_cast<uint8_t>((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                uint8_t u = static_cast<uint8_t>((-29 * r - 99 * g + 128 * b + 128) >> 8) + 128;
+                uint8_t v = static_cast<uint8_t>((128 * r - 116 * g - 12 * b + 128) >> 8) + 128;
                 size_t uvIndex = (row / 2) * (width / 2) + (col / 2);
                 uvPlane[uvIndex * 2] = u;
                 uvPlane[uvIndex * 2 + 1] = v;
@@ -902,10 +926,10 @@ static void BgraToNv12Chunk(const uint8_t* bgra, uint32_t width, uint32_t height
         for (uint32_t col = 0; col < width; ++col) {
             const uint8_t* src = bgra + (row * width + col) * 4;
             uint8_t b = src[0], g = src[1], r = src[2];
-            yPlane[row * width + col] = static_cast<uint8_t>((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            yPlane[row * width + col] = static_cast<uint8_t>((54 * r + 183 * g + 18 * b + 128) >> 8) + 16;
             if (row % 2 == 0 && col % 2 == 0) {
-                uint8_t u = static_cast<uint8_t>((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                uint8_t v = static_cast<uint8_t>((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                uint8_t u = static_cast<uint8_t>((-29 * r - 99 * g + 128 * b + 128) >> 8) + 128;
+                uint8_t v = static_cast<uint8_t>((128 * r - 116 * g - 12 * b + 128) >> 8) + 128;
                 size_t uvIndex = (row / 2) * (width / 2) + (col / 2);
                 uvPlane[uvIndex * 2] = u;
                 uvPlane[uvIndex * 2 + 1] = v;
@@ -960,8 +984,9 @@ bool MfVideoEncoder::EncodeFrame(const uint8_t* rawFrame, uint32_t width, uint32
         m_impl->needKeyFrame = false;
     }
 
-    // Force a keyframe periodically or on request
-    if (m_impl->needKeyFrame || (m_impl->frameIndex % 120 == 0)) {
+    // Force a keyframe periodically or on request — one per second,
+    // scaled to the encoder frame rate.
+    if (m_impl->needKeyFrame || (m_impl->frameIndex % m_impl->fps == 0)) {
         RequestKeyFrame();
     }
 
@@ -1467,7 +1492,7 @@ bool MfVideoEncoder::EncodeFrameGpu(ID3D11Texture2D* bgraTexture,
             if (ProcessOutput(outBitstream, outIsKeyFrame)) {
                 m_impl->frameIndex++;
                 if (outIsKeyFrame) m_impl->needKeyFrame = false;
-                if (m_impl->needKeyFrame || (m_impl->frameIndex % 120 == 0))
+                if (m_impl->needKeyFrame || (m_impl->frameIndex % m_impl->fps == 0))
                     RequestKeyFrame();
                 return true;
             }
@@ -1511,15 +1536,19 @@ bool MfVideoEncoder::EncodeFrameGpu(ID3D11Texture2D* bgraTexture,
     D3D11_MAPPED_SUBRESOURCE mapped;
     bool cpuOk = false;
     if (SUCCEEDED(m_impl->d3dContext->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
-        std::vector<uint8_t> cpuFrame(width * height * 4);
+        // Reuse cached CPU fallback buffer to avoid per-frame heap allocation (~16 MB).
+        size_t bufSize = static_cast<size_t>(width) * height * 4;
+        if (m_impl->cpuFallbackBuf.size() < bufSize) {
+            m_impl->cpuFallbackBuf.resize(bufSize);
+        }
         const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
         for (uint32_t row = 0; row < height; ++row)
-            memcpy(cpuFrame.data() + row * width * 4,
+            memcpy(m_impl->cpuFallbackBuf.data() + row * width * 4,
                    src + row * mapped.RowPitch, width * 4);
         m_impl->d3dContext->Unmap(stagingTex, 0);
         stagingTex->Release();
 
-        cpuOk = EncodeFrame(cpuFrame.data(), width, height, outBitstream, outIsKeyFrame);
+        cpuOk = EncodeFrame(m_impl->cpuFallbackBuf.data(), width, height, outBitstream, outIsKeyFrame);
         static bool loggedCpuFallback = false;
         if (!loggedCpuFallback) {
             LOG_INFO("EncodeFrameGpu: GPU path failed, fell back to CPU encode (one-time log)");

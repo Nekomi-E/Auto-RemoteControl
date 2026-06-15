@@ -56,8 +56,13 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 )";
 
 // NV12 pixel shader: Y (t0, R8_UNORM) + UV (t1, R8G8_UNORM) → BGRA.
-// Matches Nv12ToBgra CPU path exactly — operates in 8-bit integer space
-// with BT.601 limited-range coefficients, then normalizes to [0,1].
+// Uses BT.709 coefficients with limited-range input (16-235 Y, 16-240 UV),
+// matching the encoder's output color space.  Output is full-range [0,1] BGRA
+// ordered for the swap chain's B8G8R8A8_UNORM format.
+// BT.709 matrix (ITU-R BT.709-6):
+//   R = 1.1644*(Y-16) + 1.7927*(Cr-128)
+//   G = 1.1644*(Y-16) - 0.2132*(Cb-128) - 0.5329*(Cr-128)
+//   B = 1.1644*(Y-16) + 2.1124*(Cb-128)
 static const char g_PsNv12Source[] = R"(
 Texture2D<float>  texY  : register(t0);
 Texture2D<float2> texUV : register(t1);
@@ -70,14 +75,15 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     float u = Cf.r - 128.0f;
     float v = Cf.g - 128.0f;
 
-    float r = (298.0f * y + 409.0f * v + 128.0f) / 256.0f;
-    float g = (298.0f * y - 100.0f * u - 208.0f * v + 128.0f) / 256.0f;
-    float b = (298.0f * y + 516.0f * u + 128.0f) / 256.0f;
+    // BT.709 limited-range → full-range (fixed-point /256)
+    float r = (298.0f * y + 459.0f * v + 128.0f) / 256.0f;
+    float g = (298.0f * y -  55.0f * u - 136.0f * v + 128.0f) / 256.0f;
+    float b = (298.0f * y + 541.0f * u + 128.0f) / 256.0f;
 
     r = saturate(r / 255.0f);
     g = saturate(g / 255.0f);
     b = saturate(b / 255.0f);
-    return float4(b, g, r, 1.0f);
+    return float4(b, g, r, 1.0f);  // BGRA output for B8G8R8A8_UNORM swap chain
 }
 )";
 
@@ -410,6 +416,10 @@ void D3d11Renderer::Resize(uint32_t width, uint32_t height) {
     m_windowWidth = width;
     m_windowHeight = height;
 
+    // Invalidate VP pipeline — will be rebuilt at new size
+    if (m_vpNv12Tex){ m_vpNv12Tex->Release(); m_vpNv12Tex = nullptr; }
+    m_vpWidth = 0; m_vpHeight = 0; m_vpValidated = false;
+
     if (m_d2dContext) m_d2dContext->SetTarget(nullptr);
     if (m_rtv) { m_rtv->Release(); m_rtv = nullptr; }
 
@@ -523,8 +533,6 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
     if (width == 0 || height == 0) return;
 
     // Initialize or recreate the Video Processor pipeline when dimensions change.
-    // Uses D3D11 Video Processor for hardware NV12→BGRA conversion — avoids all
-    // planar-format SRV and cross-format CopySubresourceRegion issues.
     if (!m_vpEnumerator || m_vpWidth != width || m_vpHeight != height) {
         // Tear down old pipeline
         if (m_vpBgraSRV)     { m_vpBgraSRV->Release();     m_vpBgraSRV = nullptr; }
@@ -536,23 +544,25 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
         if (m_vpEnumerator)  { m_vpEnumerator->Release();  m_vpEnumerator = nullptr; }
         if (m_videoContext)  { m_videoContext->Release();  m_videoContext = nullptr; }
         if (m_videoDevice)   { m_videoDevice->Release();   m_videoDevice = nullptr; }
+        m_vpValidated = false;
 
         HRESULT hr;
 
-        // Obtain Video Device + Context from the existing D3D device
         hr = m_device->QueryInterface(IID_PPV_ARGS(&m_videoDevice));
         if (FAILED(hr)) { LOG_WARNING("VP: QueryInterface(videoDevice) failed: 0x%08X", hr); return; }
         hr = m_context->QueryInterface(IID_PPV_ARGS(&m_videoContext));
         if (FAILED(hr)) { LOG_WARNING("VP: QueryInterface(videoContext) failed: 0x%08X", hr); return; }
 
-        // Create VP enumerator (NV12 input → BGRA output)
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC vpDesc = {};
         vpDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-        vpDesc.InputFrameRate.Numerator = 60;
+        // Frame rate is informational metadata for the VP; set to a high value
+        // so drivers that internally derive buffer counts / pacing from it don't
+        // artificially throttle throughput at high display refresh rates.
+        vpDesc.InputFrameRate.Numerator = 600;
         vpDesc.InputFrameRate.Denominator = 1;
         vpDesc.InputWidth = width;
         vpDesc.InputHeight = height;
-        vpDesc.OutputFrameRate.Numerator = 60;
+        vpDesc.OutputFrameRate.Numerator = 600;
         vpDesc.OutputFrameRate.Denominator = 1;
         vpDesc.OutputWidth = width;
         vpDesc.OutputHeight = height;
@@ -560,21 +570,18 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
 
         hr = m_videoDevice->CreateVideoProcessorEnumerator(&vpDesc, &m_vpEnumerator);
         if (FAILED(hr)) { LOG_WARNING("VP: CreateVideoProcessorEnumerator failed: 0x%08X", hr); return; }
-
         hr = m_videoDevice->CreateVideoProcessor(m_vpEnumerator, 0, &m_videoProcessor);
         if (FAILED(hr)) { LOG_WARNING("VP: CreateVideoProcessor failed: 0x%08X", hr); return; }
 
-        // Our NV12 staging texture (receives planes from decoder texture)
+        // NV12 staging texture (receives CopyResource from decoder)
         {
             D3D11_TEXTURE2D_DESC desc = {};
-            desc.Width = width;
-            desc.Height = height;
-            desc.MipLevels = 1;
-            desc.ArraySize = 1;
+            desc.Width = width; desc.Height = height;
+            desc.MipLevels = 1; desc.ArraySize = 1;
             desc.Format = DXGI_FORMAT_NV12;
             desc.SampleDesc.Count = 1;
             desc.Usage = D3D11_USAGE_DEFAULT;
-            desc.BindFlags = D3D11_BIND_RENDER_TARGET; // required for VP input view
+            desc.BindFlags = D3D11_BIND_RENDER_TARGET;
             hr = m_device->CreateTexture2D(&desc, nullptr, &m_vpNv12Tex);
             if (FAILED(hr)) { LOG_WARNING("VP: CreateTexture2D(NV12) failed: 0x%08X", hr); return; }
         }
@@ -582,10 +589,8 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
         // BGRA output texture (VP target + shader input)
         {
             D3D11_TEXTURE2D_DESC desc = {};
-            desc.Width = width;
-            desc.Height = height;
-            desc.MipLevels = 1;
-            desc.ArraySize = 1;
+            desc.Width = width; desc.Height = height;
+            desc.MipLevels = 1; desc.ArraySize = 1;
             desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             desc.SampleDesc.Count = 1;
             desc.Usage = D3D11_USAGE_DEFAULT;
@@ -615,15 +620,14 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
             if (FAILED(hr)) { LOG_WARNING("VP: CreateVPOutputView failed: 0x%08X", hr); return; }
         }
 
-        // SRV on BGRA output for the standard shader
+        // SRV on BGRA output
         hr = m_device->CreateShaderResourceView(m_vpBgraTex, nullptr, &m_vpBgraSRV);
         if (FAILED(hr)) { LOG_WARNING("VP: CreateSRV(BGRA) failed: 0x%08X", hr); return; }
 
         m_vpWidth = width;
         m_vpHeight = height;
 
-        // Set BT.601 limited-range for input NV12 (matches encoder's output color space).
-        // Output BGRA uses full range (0-255) — the swap chain back buffer is sRGB full range.
+        // BT.709 limited-range NV12 input → full-range BGRA output
         {
             D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCS = {};
             inCS.YCbCr_Matrix   = 1;  // BT.709 (matches encoder output)
@@ -638,44 +642,29 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
         LOG_INFO("RenderFrameNv12: Video Processor NV12→BGRA pipeline ready (%ux%u)", width, height);
     }
 
-    // Log decoder texture description once to catch format mismatches
+    // Copy decoder NV12 texture into staging texture.
     {
-        static bool texDescLogged = false;
-        if (!texDescLogged) {
-            texDescLogged = true;
-            D3D11_TEXTURE2D_DESC decDesc;
-            nv12Texture->GetDesc(&decDesc);
-            LOG_INFO("RenderFrameNv12: decoder tex %ux%u fmt=%d mip=%d bind=0x%X usage=%d "
-                     "(VP expects %ux%u NV12=%d)",
-                     decDesc.Width, decDesc.Height, (int)decDesc.Format,
-                     decDesc.MipLevels, decDesc.BindFlags, decDesc.Usage,
-                     width, height, (int)DXGI_FORMAT_NV12);
+        D3D11_TEXTURE2D_DESC decDesc, vpDesc;
+        nv12Texture->GetDesc(&decDesc);
+        m_vpNv12Tex->GetDesc(&vpDesc);
+
+        if (decDesc.MipLevels == vpDesc.MipLevels && decDesc.ArraySize == vpDesc.ArraySize) {
+            m_context->CopyResource(m_vpNv12Tex, nv12Texture);
+        } else {
+            D3D11_BOX box;
+            box.left = 0; box.top = 0; box.front = 0;
+            box.right = width; box.bottom = height; box.back = 1;
+            m_context->CopySubresourceRegion(m_vpNv12Tex, 0, 0, 0, 0, nv12Texture, 0, &box);
+            box.right = (width + 1) / 2; box.bottom = (height + 1) / 2;
+            m_context->CopySubresourceRegion(m_vpNv12Tex, 1, 0, 0, 0, nv12Texture, 1, &box);
         }
     }
 
-    // Copy NV12 subresources from decoder texture into our VP staging texture.
-    // Source/destination are both NV12 — always format-compatible.
-    {
-        D3D11_BOX srcBox;
-        srcBox.left = 0; srcBox.top = 0; srcBox.front = 0;
-        srcBox.right = width; srcBox.bottom = height; srcBox.back = 1;
-        m_context->CopySubresourceRegion(m_vpNv12Tex, 0, 0, 0, 0,
-                                         nv12Texture, 0, &srcBox);
-    }
-    {
-        D3D11_BOX srcBox;
-        srcBox.left = 0; srcBox.top = 0; srcBox.front = 0;
-        srcBox.right = (width + 1) / 2; srcBox.bottom = (height + 1) / 2; srcBox.back = 1;
-        m_context->CopySubresourceRegion(m_vpNv12Tex, 1, 0, 0, 0,
-                                         nv12Texture, 1, &srcBox);
-    }
-
-    // Configure Video Processor stream
+    // Configure and execute VP blit (NV12 → BGRA).
     RECT rc = { 0, 0, (LONG)width, (LONG)height };
     m_videoContext->VideoProcessorSetStreamSourceRect(m_videoProcessor, 0, TRUE, &rc);
     m_videoContext->VideoProcessorSetStreamDestRect(m_videoProcessor, 0, TRUE, &rc);
 
-    // NV12 → BGRA via hardware Video Processor
     D3D11_VIDEO_PROCESSOR_STREAM stream = {};
     stream.Enable = TRUE;
     stream.OutputIndex = 0;
@@ -696,60 +685,7 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
         return;
     }
 
-    // No explicit Flush() here — the D3D11 immediate context already tracks
-    // resource dependencies. The Draw call that samples m_vpBgraTex via its
-    // SRV will implicitly wait for the VideoProcessorBlt to complete.
-    // Calling Flush() would serialize CPU/GPU and cut throughput in half.
-
-    // One-time validation: read back a small block of the VP BGRA output to
-    // verify it contains non-black pixels. This catches misconfigured color
-    // space, broken VP pipelines, and all-zero decoder output.
-    if (!m_vpValidated) {
-        D3D11_TEXTURE2D_DESC stagingDesc = {};
-        stagingDesc.Width  = std::min(width, 64u);
-        stagingDesc.Height = std::min(height, 64u);
-        stagingDesc.MipLevels = 1;
-        stagingDesc.ArraySize = 1;
-        stagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        stagingDesc.SampleDesc.Count = 1;
-        stagingDesc.Usage = D3D11_USAGE_STAGING;
-        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        ID3D11Texture2D* stagingTex = nullptr;
-        HRESULT stagingHr = m_device->CreateTexture2D(&stagingDesc, nullptr, &stagingTex);
-        if (FAILED(stagingHr)) {
-            LOG_WARNING("VP validation: CreateTexture2D(staging) failed: 0x%08X", stagingHr);
-            m_vpValidated = true;
-            return;
-        }
-        D3D11_BOX box;
-        box.left = 0; box.top = 0; box.front = 0;
-        box.right = stagingDesc.Width; box.bottom = stagingDesc.Height; box.back = 1;
-        m_context->CopySubresourceRegion(stagingTex, 0, 0, 0, 0,
-                                         m_vpBgraTex, 0, &box);
-        D3D11_MAPPED_SUBRESOURCE mapped = {};
-        HRESULT mapHr = m_context->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(mapHr)) {
-            LOG_WARNING("VP validation: Map(staging) failed: 0x%08X (rowPitch=%u depthPitch=%u)",
-                        mapHr, mapped.RowPitch, mapped.DepthPitch);
-            stagingTex->Release();
-            m_vpValidated = true;
-            return;
-        }
-        const uint8_t* p = static_cast<const uint8_t*>(mapped.pData);
-        uint32_t nonZero = 0;
-        uint32_t count = stagingDesc.Width * stagingDesc.Height * 4;
-        if (count > 256) count = 256;
-        for (uint32_t i = 0; i < count; ++i)
-            if (p[i] != 0) ++nonZero;
-        m_context->Unmap(stagingTex, 0);
-        stagingTex->Release();
-        LOG_INFO("RenderFrameNv12: VP output validation — %u of %u BGRA bytes non-zero "
-                 "(first pixel: B=%u G=%u R=%u A=%u)",
-                 nonZero, count, p[0], p[1], p[2], p[3]);
-        m_vpValidated = true;
-    }
-
-    // Render the BGRA output via the standard BGRA shader
+    // Draw the BGRA output via the standard BGRA shader
     UINT stride = sizeof(QuadVertex);
     UINT offset = 0;
     m_context->IASetVertexBuffers(0, 1, &m_quadVB, &stride, &offset);

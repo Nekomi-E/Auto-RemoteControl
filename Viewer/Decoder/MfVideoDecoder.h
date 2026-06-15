@@ -30,6 +30,7 @@ public:
                         uint32_t& outWidth, uint32_t& outHeight);
 
     bool HasGpuPath() const;
+    ID3D11Device* GetD3DDevice() const;  // nullptr if CPU-only
 
 private:
     struct Impl;

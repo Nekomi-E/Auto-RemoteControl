@@ -30,6 +30,8 @@ AgentConfig Config::ParseAgentArgs(int argc, char* argv[]) {
             parseUint32(argv[++i], cfg.videoBitrate);
         } else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
             parseUint32(argv[++i], cfg.targetFps);
+            if (cfg.targetFps < 10) cfg.targetFps = 10;
+            if (cfg.targetFps > 120) cfg.targetFps = 120;
         } else if (strcmp(argv[i], "--no-audio") == 0) {
             cfg.enableAudio = false;
         } else if (strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
@@ -37,6 +39,8 @@ AgentConfig Config::ParseAgentArgs(int argc, char* argv[]) {
             if (cfg.videoQuality > 2) cfg.videoQuality = 2;
         } else if (strcmp(argv[i], "--no-encrypt") == 0) {
             cfg.enableEncryption = false;
+        } else if (strcmp(argv[i], "--vfr") == 0) {
+            cfg.variableFrameRate = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             PrintAgentHelp();
             exit(0);
@@ -60,6 +64,12 @@ ViewerConfig Config::ParseViewerArgs(int argc, char* argv[]) {
             cfg.enableEncryption = false;
         } else if (strcmp(argv[i], "--fullscreen") == 0) {
             cfg.fullscreen = true;
+        } else if (strcmp(argv[i], "--vfr") == 0) {
+            cfg.variableFrameRate = true;
+        } else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+            parseUint32(argv[++i], cfg.targetFps);
+            if (cfg.targetFps < 10) cfg.targetFps = 10;
+            if (cfg.targetFps > 120) cfg.targetFps = 120;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             PrintViewerHelp();
             exit(0);
@@ -75,7 +85,8 @@ void Config::PrintAgentHelp() {
     printf("  --port N        TCP/UDP port to listen on (default: 27015)\n");
     printf("  --password STR  Authentication password (required)\n");
     printf("  --bitrate N     Video bitrate in bps (default: auto, scaled to resolution)\n");
-    printf("  --fps N         Target capture framerate (default: 60)\n");
+    printf("  --fps N         Target capture framerate 10-120 (default: 60)\n");
+    printf("  --vfr           Variable frame rate — capture at DXGI natural rate\n");
     printf("  --quality N     Video quality: 0=auto 1=balanced 2=lossless (default: 0)\n");
     printf("  --no-audio      Disable audio capture\n");
     printf("  --no-encrypt    Disable encryption (not recommended)\n");
@@ -89,6 +100,8 @@ void Config::PrintViewerHelp() {
     printf("  --host IP       Agent IP address to connect to (default: 127.0.0.1)\n");
     printf("  --port N        TCP/UDP port (default: 27015)\n");
     printf("  --password STR  Authentication password (required)\n");
+    printf("  --fps N         Target render framerate 10-120 (default: 60)\n");
+    printf("  --vfr           Variable frame rate — render at decode rate\n");
     printf("  --no-audio      Disable audio playback\n");
     printf("  --no-encrypt    Disable encryption (not recommended)\n");
     printf("  --fullscreen    Start in fullscreen mode\n");

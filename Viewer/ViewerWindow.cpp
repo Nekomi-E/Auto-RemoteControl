@@ -76,8 +76,8 @@ bool ViewerWindow::Create(HINSTANCE hInstance, uint32_t width, uint32_t height, 
 
     RegisterRawInput();
 
-    ShowWindow(m_hwnd, SW_SHOW);//ÏÔÊ¾´°¿Ú
-    UpdateWindow(m_hwnd);//Ç¿ÖÆ´°¿ÚÖØ»æ
+    ShowWindow(m_hwnd, SW_SHOW);//ï¿½ï¿½Ê¾ï¿½ï¿½ï¿½ï¿½
+    UpdateWindow(m_hwnd);//Ç¿ï¿½Æ´ï¿½ï¿½ï¿½ï¿½Ø»ï¿½
 
     LOG_INFO("Viewer window created: %ux%u", width, height);
     return true;
@@ -98,17 +98,16 @@ void ViewerWindow::RegisterRawInput() {
     rid[1].dwFlags = RIDEV_INPUTSINK;
     rid[1].hwndTarget = m_hwnd;
 
-    RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));//×¢²áÔ­Ê¼ÊäÈëÉè±¸£¬Ê¹´°¿ÚÄÜ½ÓÊÕ¼üÅÌ/Êó±êÊäÈë (¼´±ã´°¿Ú²»ÔÚÇ°Ì¨)
+    RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));//×¢ï¿½ï¿½Ô­Ê¼ï¿½ï¿½ï¿½ï¿½ï¿½è±¸ï¿½ï¿½Ê¹ï¿½ï¿½ï¿½ï¿½ï¿½Ü½ï¿½ï¿½Õ¼ï¿½ï¿½ï¿½/ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (ï¿½ï¿½ï¿½ã´°ï¿½Ú²ï¿½ï¿½ï¿½Ç°Ì¨)
 }
 
 void ViewerWindow::SetInputActive(bool active) {
     m_inputActive = active;
+    if (g_session) g_session->SetInputActive(active);
     if (active) {
         SetWindowTextW(m_hwnd, L"RemoteControl - Viewer [INPUT ACTIVE - Scroll Lock to release]");
-        // Capture cursor
         SetCapture(m_hwnd);
         ShowCursor(FALSE);
-        // Clip cursor to window
         RECT rect;
         GetClientRect(m_hwnd, &rect);
         ClientToScreen(m_hwnd, (POINT*)&rect.left);
@@ -119,18 +118,12 @@ void ViewerWindow::SetInputActive(bool active) {
         ReleaseCapture();
         ShowCursor(TRUE);
         ClipCursor(nullptr);
-        m_lastScrollLock = false;  // reset so next Scroll Lock press activates correctly
     }
 }
 
 void ViewerWindow::ProcessPendingEvents(ViewerSession& session) {
-    // Check for Scroll Lock toggle to activate/deactivate input mode
-    bool scrollLock = (GetKeyState(VK_SCROLL) & 1) != 0;
-
-    if (scrollLock != m_lastScrollLock) {
-        m_lastScrollLock = scrollLock;
-        SetInputActive(scrollLock);
-    }
+    // Input toggle is now handled directly in WndProc via WM_KEYDOWN
+    // for VK_SCROLL â€” a single key-press toggles, no long-press needed.
 }
 
 LRESULT CALLBACK ViewerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -160,9 +153,27 @@ LRESULT CALLBACK ViewerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         return 0;
 
     case WM_KEYDOWN:
-    case WM_KEYUP:
     case WM_SYSKEYDOWN:
+        // Scroll Lock toggles input capture on a SINGLE press.
+        // Bit 30 of lParam is 1 for auto-repeat â€” we ignore repeats
+        // so holding the key doesn't flip the state rapidly.
+        if (wParam == VK_SCROLL && self && !(lParam & (1 << 30))) {
+            self->SetInputActive(!self->m_inputActive);
+            return 0;  // consumed, not forwarded to Agent
+        }
+        // Scroll Lock is never forwarded to the remote host even when
+        // input is active â€” it's a Viewer-local control.
+        if (wParam == VK_SCROLL) return 0;
+        if (self && self->m_inputActive && g_session) {
+            g_session->OnKeyEvent(msg, wParam, lParam);
+            return 0;
+        }
+        break;
+
+    case WM_KEYUP:
     case WM_SYSKEYUP:
+        // Scroll Lock: consumed locally, never forwarded
+        if (wParam == VK_SCROLL) return 0;
         if (self && self->m_inputActive && g_session) {
             g_session->OnKeyEvent(msg, wParam, lParam);
             return 0;
@@ -170,6 +181,12 @@ LRESULT CALLBACK ViewerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         break;
 
     case WM_MOUSEMOVE:
+        // When input is active, RawInput (WM_INPUT) provides correct relative
+        // mouse deltas â€” skip WM_MOUSEMOVE to avoid sending absolute coords.
+        // When inactive, pass through to DefWindowProc for normal cursor behaviour.
+        if (self && self->m_inputActive) return 0;
+        break;
+
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP:
     case WM_RBUTTONDOWN:

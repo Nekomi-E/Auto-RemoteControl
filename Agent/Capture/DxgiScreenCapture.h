@@ -12,7 +12,7 @@ struct ID3D11Texture2D;
 class DxgiScreenCapture {
 public:
     struct CapturedFrame {
-        std::vector<uint8_t> data;//×Ö½ÚÊı×é£¬°´ÕÕBGRA¸ñÊ½´æ´¢ÖğĞĞÉ¨ÃèµÄÏñËØÊı¾İ  Ã¿¸öÏñËØÕ¼B,G,R,AËÄ¸ö×Ö½Ú
+        std::vector<uint8_t> data;//ï¿½Ö½ï¿½ï¿½ï¿½ï¿½é£¬ï¿½ï¿½ï¿½ï¿½BGRAï¿½ï¿½Ê½ï¿½æ´¢ï¿½ï¿½ï¿½ï¿½É¨ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½  Ã¿ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Õ¼B,G,R,Aï¿½Ä¸ï¿½ï¿½Ö½ï¿½
         uint32_t width = 0;
         uint32_t height = 0;
         int64_t timestampMs = 0;
@@ -53,6 +53,11 @@ private:
         uint32_t poolWidth = 0;
         uint32_t poolHeight = 0;
         int poolIndex = 0;
+
+        // Monitor refresh rate (Hz) â€” queried from DXGI output descriptor.
+        // DXGI Desktop Duplication cannot exceed the display's VSync rate;
+        // this field is used for diagnostic logging when target FPS > refresh.
+        float refreshRate = 60.0f;
     };
 
     ID3D11Device* m_device = nullptr;
@@ -61,6 +66,7 @@ private:
     int m_currentMonitor = 0;
     int64_t m_lastFrameTime = 0;
     uint32_t m_targetFps = 60;
+    bool m_timerResolutionSet = false;
 };
 
 // Helper to save BGRA frame to BMP file (for debugging)

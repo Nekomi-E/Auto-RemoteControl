@@ -3,10 +3,14 @@
 #include <cstdint>
 #include <memory>
 #include <atomic>
+#include <functional>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11Texture2D;
+
+// Forward-declare ThreadSafeQueue as a template
+template<typename T> class ThreadSafeQueue;
 
 class EncoderManager {
 public:
@@ -33,6 +37,13 @@ public:
                     ID3D11Device* d3dDevice = nullptr,
                     ID3D11DeviceContext* d3dContext = nullptr);
     void Stop();
+
+    // Set a direct-output queue for encoded video frames.
+    // When set, the internal encode thread pushes encoded frames directly to
+    // this queue instead of the internal videoOutputQueue, eliminating one
+    // thread-hop and one queue in the Agent pipeline.
+    // The queue must outlive the EncoderManager.
+    void SetDirectVideoOutputQueue(ThreadSafeQueue<EncodedFrame>* queue);
 
     void SubmitVideoFrame(std::vector<uint8_t> rawData,
                           uint32_t width, uint32_t height,

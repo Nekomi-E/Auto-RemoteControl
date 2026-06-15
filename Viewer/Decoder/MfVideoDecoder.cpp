@@ -9,6 +9,7 @@
 #include <codecapi.h>
 #include <wmcodecdsp.h>
 #include <d3d11.h>
+#include <d3d10.h>       // ID3D10Multithread
 #include <cstring>
 #include <thread>
 
@@ -16,6 +17,7 @@
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxguid.lib")  // IID_ID3D10Multithread
 
 struct MfVideoDecoder::Impl {
     IMFTransform* mft = nullptr;
@@ -36,6 +38,12 @@ struct MfVideoDecoder::Impl {
     IMFDXGIDeviceManager* deviceManager = nullptr;
     UINT deviceResetToken = 0;
     bool gpuDecodeAvailable = false;
+    bool ownD3DDevice = false;  // true if we created d3dDevice internally
+
+    // Reusable buffer for CPU-fallback NV12 upload path (~4 MB @ 1920x1080).
+    // Avoids per-frame heap allocation when the hardware decoder produces
+    // system-memory output that needs GPU upload.
+    std::vector<uint8_t> compactUploadBuf;
 
     // Track stream changes so callers can re-feed after format negotiation
     uint32_t streamChangeCount = 0;
@@ -166,10 +174,36 @@ bool MfVideoDecoder::InitializeWithD3D11(uint32_t codecType, uint32_t width, uin
             return false;
     }
 
-    if (!device || !context || !m_impl->mft) {
-        LOG_INFO("D3D11 interop skipped: device=%p context=%p mft=%p",
-                 (void*)device, (void*)context, (void*)m_impl->mft);
-        return true; // fall back to CPU — already initialized
+    if (!m_impl->mft) {
+        LOG_INFO("D3D11 interop skipped: no MFT");
+        return true;
+    }
+
+    // When no external device is provided, create an independent D3D11 device
+    // so the MFT's GPU work runs on a separate command queue from the renderer.
+    // This eliminates the GPU serialisation that limited throughput at high res.
+    ID3D11Device* localDevice = nullptr;
+    ID3D11DeviceContext* localContext = nullptr;
+    if (!device || !context) {
+        UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT
+                   | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                        flags, nullptr, 0, D3D11_SDK_VERSION,
+                                        &localDevice, nullptr, &localContext);
+        if (FAILED(hr)) {
+            LOG_INFO("Failed to create own D3D11 device for decoder (hr=0x%08X), "
+                     "using CPU path", hr);
+            return true;
+        }
+        ID3D10Multithread* mt = nullptr;
+        if (SUCCEEDED(localDevice->QueryInterface(IID_ID3D10Multithread, (void**)&mt))) {
+            mt->SetMultithreadProtected(TRUE);
+            mt->Release();
+        }
+        m_impl->ownD3DDevice = true;
+        device = localDevice;
+        context = localContext;
+        LOG_INFO("Decoder using independent D3D11 device — separate GPU queue from renderer");
     }
 
     // Check if the activated MFT is D3D11-aware
@@ -239,6 +273,10 @@ bool MfVideoDecoder::HasGpuPath() const {
     return m_impl->gpuDecodeAvailable;
 }
 
+ID3D11Device* MfVideoDecoder::GetD3DDevice() const {
+    return m_impl->d3dDevice;
+}
+
 void MfVideoDecoder::Shutdown() {
     if (m_impl->mft) m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
     m_impl->initialized = false;
@@ -247,10 +285,17 @@ void MfVideoDecoder::Shutdown() {
     if (m_impl->inputType) m_impl->inputType->Release();
     if (m_impl->outputType) m_impl->outputType->Release();
     if (m_impl->deviceManager) m_impl->deviceManager->Release();
+    if (m_impl->ownD3DDevice) {
+        if (m_impl->d3dContext) m_impl->d3dContext->Release();
+        if (m_impl->d3dDevice) m_impl->d3dDevice->Release();
+        m_impl->ownD3DDevice = false;
+    }
     m_impl->mft = nullptr;
     m_impl->inputType = nullptr;
     m_impl->outputType = nullptr;
     m_impl->deviceManager = nullptr;
+    m_impl->d3dDevice = nullptr;
+    m_impl->d3dContext = nullptr;
     m_impl->d3dDevice = nullptr;
     m_impl->d3dContext = nullptr;
 }
@@ -275,9 +320,10 @@ static void Nv12ToBgra(const uint8_t* nv12, uint32_t width, uint32_t height,
             int u = uvPlane[uvRowOff] - 128;
             int v = uvPlane[uvRowOff + 1] - 128;
 
-            int r = (298 * y + 409 * v + 128) >> 8;
-            int g = (298 * y - 100 * u - 208 * v + 128) >> 8;
-            int b = (298 * y + 516 * u + 128) >> 8;
+            // BT.709 limited-range → full-range (fixed-point /256)
+            int r = (298 * y + 459 * v + 128) >> 8;
+            int g = (298 * y -  55 * u - 136 * v + 128) >> 8;
+            int b = (298 * y + 541 * u + 128) >> 8;
 
             r = r < 0 ? 0 : (r > 255 ? 255 : r);
             g = g < 0 ? 0 : (g > 255 ? 255 : g);
@@ -304,9 +350,10 @@ static void Nv12ToBgraChunk(const uint8_t* yPlane, const uint8_t* uvPlane,
             int u = uvPlane[uvRowOff] - 128;
             int v = uvPlane[uvRowOff + 1] - 128;
 
-            int r = (298 * y + 409 * v + 128) >> 8;
-            int g = (298 * y - 100 * u - 208 * v + 128) >> 8;
-            int b = (298 * y + 516 * u + 128) >> 8;
+            // BT.709 limited-range → full-range (fixed-point /256)
+            int r = (298 * y + 459 * v + 128) >> 8;
+            int g = (298 * y -  55 * u - 136 * v + 128) >> 8;
+            int b = (298 * y + 541 * u + 128) >> 8;
 
             r = r < 0 ? 0 : (r > 255 ? 255 : r);
             g = g < 0 ? 0 : (g > 255 ? 255 : g);
@@ -368,9 +415,10 @@ static void Yv12ToBgra(const uint8_t* yv12, uint32_t width, uint32_t height,
             int v = vPlane[cOff] - 128;
             int u = uPlane[cOff] - 128;
 
-            int r = (298 * y + 409 * v + 128) >> 8;
-            int g = (298 * y - 100 * u - 208 * v + 128) >> 8;
-            int b = (298 * y + 516 * u + 128) >> 8;
+            // BT.709 limited-range → full-range (fixed-point /256)
+            int r = (298 * y + 459 * v + 128) >> 8;
+            int g = (298 * y -  55 * u - 136 * v + 128) >> 8;
+            int b = (298 * y + 541 * u + 128) >> 8;
 
             r = r < 0 ? 0 : (r > 255 ? 255 : r);
             g = g < 0 ? 0 : (g > 255 ? 255 : g);
@@ -830,7 +878,8 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
                                    ID3D11Texture2D*& outNv12Texture,
                                    uint32_t& outWidth, uint32_t& outHeight,
                                    int& failCount, size_t inputLen,
-                                   bool& outStreamChanged) {
+                                   bool& outStreamChanged,
+                                   std::vector<uint8_t>& compactUploadBuf) {
     outStreamChanged = false;
     outNv12Texture = nullptr;
     MFT_OUTPUT_STREAM_INFO streamInfo = {};
@@ -943,8 +992,12 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
                     // Build contiguous upload buffer.
                     // The decoded buffer may have padding (stride > width) so
                     // we compact each row and pack Y + UV planes back-to-back.
-                    std::vector<uint8_t> compact(width * height * 3 / 2);
-                    uint8_t* yDst = compact.data();
+                    // Reuse a cached buffer to avoid per-frame heap allocation.
+                    size_t compactSize = static_cast<size_t>(width) * height * 3 / 2;
+                    if (compactUploadBuf.size() < compactSize) {
+                        compactUploadBuf.resize(compactSize);
+                    }
+                    uint8_t* yDst = compactUploadBuf.data();
                     for (uint32_t row = 0; row < height; ++row) {
                         memcpy(yDst, nv12Data + row * nv12Stride, width);
                         yDst += width;
@@ -956,7 +1009,7 @@ static bool DrainDecoderOutputGpu(IMFTransform* mft, uint32_t& width, uint32_t& 
                     }
 
                     D3D11_SUBRESOURCE_DATA initData = {};
-                    initData.pSysMem = compact.data();
+                    initData.pSysMem = compactUploadBuf.data();
                     initData.SysMemPitch = width;
                     initData.SysMemSlicePitch = width * height;
 
@@ -1079,7 +1132,7 @@ bool MfVideoDecoder::DecodeFrameGpu(const uint8_t* bitstream, size_t len,
                               m_impl->formatEstablished,
                               m_impl->d3dDevice,
                               outNv12Texture, outWidth, outHeight, failCount, len,
-                              streamChanged);
+                              streamChanged, m_impl->compactUploadBuf);
 
         hr = MFCreateMemoryBuffer(static_cast<DWORD>(len), &mediaBuffer);
         if (FAILED(hr)) return false;
@@ -1112,7 +1165,7 @@ bool MfVideoDecoder::DecodeFrameGpu(const uint8_t* bitstream, size_t len,
                                           m_impl->formatEstablished,
                                           m_impl->d3dDevice,
                                           outNv12Texture, outWidth, outHeight, failCount, len,
-                                          streamChanged);
+                                          streamChanged, m_impl->compactUploadBuf);
 
     if (!gotFrame && streamChanged) {
         LOG_INFO("Re-feeding (GPU) after stream change: %zu bytes", len);
@@ -1139,7 +1192,8 @@ bool MfVideoDecoder::DecodeFrameGpu(const uint8_t* bitstream, size_t len,
                                                          m_impl->formatEstablished,
                                                          m_impl->d3dDevice,
                                                          outNv12Texture, outWidth, outHeight,
-                                                         failCount, len, ignored);
+                                                         failCount, len, ignored,
+                                                         m_impl->compactUploadBuf);
                         LOG_INFO("Re-feed drain (GPU) result: gotFrame=%d", gotFrame ? 1 : 0);
                     } else {
                         LOG_WARNING("Re-feed ProcessInput (GPU) failed: 0x%08X", hr);
