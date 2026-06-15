@@ -127,8 +127,8 @@ void ViewerWindow::ProcessPendingEvents(ViewerSession& session) {
     static bool lastScrollLock = false;
     bool scrollLock = (GetKeyState(VK_SCROLL) & 1) != 0;
 
-    if (scrollLock != lastScrollLock) {
-        lastScrollLock = scrollLock;
+    if (scrollLock != m_lastScrollLock) {
+        m_lastScrollLock = scrollLock;
         SetInputActive(scrollLock);
     }
 }
