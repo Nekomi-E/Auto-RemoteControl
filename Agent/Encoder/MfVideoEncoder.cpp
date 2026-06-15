@@ -855,12 +855,11 @@ void MfVideoEncoder::FinalizeMediaTypes(uint32_t resW, uint32_t resH) {
         //    estimation refinements and RDO passes that add frame pipeline depth.
         attrs->SetUINT32(CODECAPI_AVEncCommonQualityVsSpeed, 0);
 
-        // 4. GOP size = 1 keyframe per second (scaled to FPS).  The default
-        //    GOP is often 60–250 frames (1–4 s), which means the decoder must
-        //    buffer up to 4 s before the first picture can be output.
-        //    One keyframe per second caps decode-start delay at ~1 s while
-        //    preserving reasonable P-frame compression efficiency.
-        attrs->SetUINT32(CODECAPI_AVEncMPVGOPSize, m_impl->fps);
+        // 4. GOP size = 30 frames — a keyframe every ~0.25–0.5 s.
+        //    Shorter GOPs reset P-frame accumulation errors sooner,
+        //    preventing subtle quality drift (blur) on static desktop content
+        //    over many successive predicted frames.
+        attrs->SetUINT32(CODECAPI_AVEncMPVGOPSize, 30);
 
         attrs->Release();
     }
@@ -986,7 +985,7 @@ bool MfVideoEncoder::EncodeFrame(const uint8_t* rawFrame, uint32_t width, uint32
 
     // Force a keyframe periodically or on request — one per second,
     // scaled to the encoder frame rate.
-    if (m_impl->needKeyFrame || (m_impl->frameIndex % m_impl->fps == 0)) {
+    if (m_impl->needKeyFrame || (m_impl->frameIndex % 30 == 0)) {
         RequestKeyFrame();
     }
 
@@ -1492,7 +1491,7 @@ bool MfVideoEncoder::EncodeFrameGpu(ID3D11Texture2D* bgraTexture,
             if (ProcessOutput(outBitstream, outIsKeyFrame)) {
                 m_impl->frameIndex++;
                 if (outIsKeyFrame) m_impl->needKeyFrame = false;
-                if (m_impl->needKeyFrame || (m_impl->frameIndex % m_impl->fps == 0))
+                if (m_impl->needKeyFrame || (m_impl->frameIndex % 30 == 0))
                     RequestKeyFrame();
                 return true;
             }

@@ -66,10 +66,8 @@ private:
     ID3D11PixelShader* m_pixelShaderNv12 = nullptr;    // NV12→BGRA converter
     ID3D11InputLayout* m_inputLayout = nullptr;
 
-    // Video Processor pipeline for NV12→BGRA conversion.
-    // Decoder's NV12 texture is copied into m_vpNv12Tex, then
-    // VideoProcessorBlt does the hardware color-space conversion
-    // into m_vpBgraTex, which is rendered via the standard BGRA shader.
+    // VP pipeline: NV12→BGRA via D3D11 Video Processor output directly to
+    // the swap-chain back buffer (no intermediate BGRA texture, no extra Draw).
     ID3D11Texture2D* m_vpNv12Tex = nullptr;
     ID3D11VideoDevice* m_videoDevice = nullptr;
     ID3D11VideoContext* m_videoContext = nullptr;
@@ -77,11 +75,12 @@ private:
     ID3D11VideoProcessorEnumerator* m_vpEnumerator = nullptr;
     ID3D11VideoProcessorInputView* m_vpInputView = nullptr;
     ID3D11VideoProcessorOutputView* m_vpOutputView = nullptr;
-    ID3D11Texture2D* m_vpBgraTex = nullptr;
-    ID3D11ShaderResourceView* m_vpBgraSRV = nullptr;
+    ID3D11ShaderResourceView* m_vpNv12SRV_Y = nullptr;   // unused, retained
+    ID3D11ShaderResourceView* m_vpNv12SRV_UV = nullptr;  // unused, retained
+    ID3D11Texture2D* m_vpBgraTex = nullptr;              // unused, retained
+    ID3D11ShaderResourceView* m_vpBgraSRV = nullptr;     // unused, retained
     uint32_t m_vpWidth = 0;
     uint32_t m_vpHeight = 0;
-    bool m_vpValidated = false;  // one-time VP output validation
 
     uint32_t m_textureWidth = 0;
     uint32_t m_textureHeight = 0;

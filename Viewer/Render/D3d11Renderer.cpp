@@ -70,7 +70,10 @@ SamplerState      samp  : register(s0);
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     float  Yf = texY.Sample(samp, uv).r * 255.0f;
-    float2 Cf = texUV.Sample(samp, uv).rg * 255.0f;
+    // D3D11 planar R8G8_UNORM SRV of NV12 subresource 1: driver-dependent
+    // whether R→U(Cb)/G→V(Cr) or R→V(Cr)/G→U(Cb).  Using .gr (swapped)
+    // empirically matches NVIDIA's byte mapping.
+    float2 Cf = texUV.Sample(samp, uv).gr * 255.0f;
     float y = Yf - 16.0f;
     float u = Cf.r - 128.0f;
     float v = Cf.g - 128.0f;
@@ -370,6 +373,8 @@ void D3d11Renderer::Shutdown() {
     if (m_vertexShader) m_vertexShader->Release();
     if (m_quadVB) m_quadVB->Release();
     if (m_sampler) m_sampler->Release();
+    if (m_vpNv12SRV_Y)  m_vpNv12SRV_Y->Release();
+    if (m_vpNv12SRV_UV) m_vpNv12SRV_UV->Release();
     if (m_vpBgraSRV) m_vpBgraSRV->Release();
     if (m_vpOutputView) m_vpOutputView->Release();
     if (m_vpInputView) m_vpInputView->Release();
@@ -386,6 +391,8 @@ void D3d11Renderer::Shutdown() {
     if (m_context) m_context->Release();
     if (m_device) m_device->Release();
 
+    m_vpNv12SRV_Y = nullptr;
+    m_vpNv12SRV_UV = nullptr;
     m_vpBgraSRV = nullptr;
     m_vpOutputView = nullptr;
     m_vpInputView = nullptr;
@@ -416,9 +423,11 @@ void D3d11Renderer::Resize(uint32_t width, uint32_t height) {
     m_windowWidth = width;
     m_windowHeight = height;
 
-    // Invalidate VP pipeline — will be rebuilt at new size
-    if (m_vpNv12Tex){ m_vpNv12Tex->Release(); m_vpNv12Tex = nullptr; }
-    m_vpWidth = 0; m_vpHeight = 0; m_vpValidated = false;
+    // Invalidate NV12 shader pipeline — rebuilt at new size
+    if (m_vpNv12SRV_Y) { m_vpNv12SRV_Y->Release(); m_vpNv12SRV_Y = nullptr; }
+    if (m_vpNv12SRV_UV){ m_vpNv12SRV_UV->Release(); m_vpNv12SRV_UV = nullptr; }
+    if (m_vpNv12Tex)   { m_vpNv12Tex->Release();   m_vpNv12Tex = nullptr; }
+    m_vpWidth = 0; m_vpHeight = 0;
 
     if (m_d2dContext) m_d2dContext->SetTarget(nullptr);
     if (m_rtv) { m_rtv->Release(); m_rtv = nullptr; }
@@ -532,171 +541,88 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
     if (!m_device || !m_context || !m_rtv || !nv12Texture) return;
     if (width == 0 || height == 0) return;
 
-    // Initialize or recreate the Video Processor pipeline when dimensions change.
     if (!m_vpEnumerator || m_vpWidth != width || m_vpHeight != height) {
-        // Tear down old pipeline
-        if (m_vpBgraSRV)     { m_vpBgraSRV->Release();     m_vpBgraSRV = nullptr; }
         if (m_vpOutputView)  { m_vpOutputView->Release();  m_vpOutputView = nullptr; }
         if (m_vpInputView)   { m_vpInputView->Release();   m_vpInputView = nullptr; }
-        if (m_vpBgraTex)     { m_vpBgraTex->Release();     m_vpBgraTex = nullptr; }
         if (m_vpNv12Tex)     { m_vpNv12Tex->Release();     m_vpNv12Tex = nullptr; }
         if (m_videoProcessor) { m_videoProcessor->Release(); m_videoProcessor = nullptr; }
         if (m_vpEnumerator)  { m_vpEnumerator->Release();  m_vpEnumerator = nullptr; }
         if (m_videoContext)  { m_videoContext->Release();  m_videoContext = nullptr; }
         if (m_videoDevice)   { m_videoDevice->Release();   m_videoDevice = nullptr; }
-        m_vpValidated = false;
 
         HRESULT hr;
-
         hr = m_device->QueryInterface(IID_PPV_ARGS(&m_videoDevice));
-        if (FAILED(hr)) { LOG_WARNING("VP: QueryInterface(videoDevice) failed: 0x%08X", hr); return; }
+        if (FAILED(hr)) { LOG_WARNING("VP: videoDevice failed"); return; }
         hr = m_context->QueryInterface(IID_PPV_ARGS(&m_videoContext));
-        if (FAILED(hr)) { LOG_WARNING("VP: QueryInterface(videoContext) failed: 0x%08X", hr); return; }
+        if (FAILED(hr)) { LOG_WARNING("VP: videoContext failed"); return; }
 
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC vpDesc = {};
         vpDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-        // Frame rate is informational metadata for the VP; set to a high value
-        // so drivers that internally derive buffer counts / pacing from it don't
-        // artificially throttle throughput at high display refresh rates.
-        vpDesc.InputFrameRate.Numerator = 600;
-        vpDesc.InputFrameRate.Denominator = 1;
-        vpDesc.InputWidth = width;
-        vpDesc.InputHeight = height;
-        vpDesc.OutputFrameRate.Numerator = 600;
-        vpDesc.OutputFrameRate.Denominator = 1;
-        vpDesc.OutputWidth = width;
-        vpDesc.OutputHeight = height;
+        vpDesc.InputFrameRate.Numerator = 600; vpDesc.InputFrameRate.Denominator = 1;
+        vpDesc.InputWidth = width; vpDesc.InputHeight = height;
+        vpDesc.OutputFrameRate.Numerator = 600; vpDesc.OutputFrameRate.Denominator = 1;
+        vpDesc.OutputWidth = width; vpDesc.OutputHeight = height;
         vpDesc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
 
         hr = m_videoDevice->CreateVideoProcessorEnumerator(&vpDesc, &m_vpEnumerator);
-        if (FAILED(hr)) { LOG_WARNING("VP: CreateVideoProcessorEnumerator failed: 0x%08X", hr); return; }
+        if (FAILED(hr)) { LOG_WARNING("VP: enumerator failed"); return; }
         hr = m_videoDevice->CreateVideoProcessor(m_vpEnumerator, 0, &m_videoProcessor);
-        if (FAILED(hr)) { LOG_WARNING("VP: CreateVideoProcessor failed: 0x%08X", hr); return; }
+        if (FAILED(hr)) { LOG_WARNING("VP: processor failed"); return; }
 
-        // NV12 staging texture (receives CopyResource from decoder)
+        // NV12 staging
+        { D3D11_TEXTURE2D_DESC d = {}; d.Width=width; d.Height=height; d.MipLevels=1;
+          d.ArraySize=1; d.Format=DXGI_FORMAT_NV12; d.SampleDesc.Count=1;
+          d.Usage=D3D11_USAGE_DEFAULT; d.BindFlags=D3D11_BIND_RENDER_TARGET;
+          hr=m_device->CreateTexture2D(&d,nullptr,&m_vpNv12Tex);
+          if(FAILED(hr)){LOG_WARNING("VP: NV12 tex failed");return;} }
+
+        // VP input view
+        { D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv={}; iv.FourCC=0;
+          iv.ViewDimension=D3D11_VPIV_DIMENSION_TEXTURE2D;
+          iv.Texture2D.MipSlice=0; iv.Texture2D.ArraySlice=0;
+          hr=m_videoDevice->CreateVideoProcessorInputView(m_vpNv12Tex,m_vpEnumerator,&iv,&m_vpInputView);
+          if(FAILED(hr)){LOG_WARNING("VP: input view failed");return;} }
+
+        // VP output view → directly to swap-chain back buffer (no BGRA intermediate)
         {
-            D3D11_TEXTURE2D_DESC desc = {};
-            desc.Width = width; desc.Height = height;
-            desc.MipLevels = 1; desc.ArraySize = 1;
-            desc.Format = DXGI_FORMAT_NV12;
-            desc.SampleDesc.Count = 1;
-            desc.Usage = D3D11_USAGE_DEFAULT;
-            desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-            hr = m_device->CreateTexture2D(&desc, nullptr, &m_vpNv12Tex);
-            if (FAILED(hr)) { LOG_WARNING("VP: CreateTexture2D(NV12) failed: 0x%08X", hr); return; }
+            ID3D11Texture2D* backBuffer = nullptr;
+            hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+            if (FAILED(hr)) { LOG_WARNING("VP: GetBuffer failed"); return; }
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov = {};
+            ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+            hr = m_videoDevice->CreateVideoProcessorOutputView(backBuffer, m_vpEnumerator, &ov, &m_vpOutputView);
+            backBuffer->Release();
+            if (FAILED(hr)) { LOG_WARNING("VP: output view on back buffer failed"); return; }
         }
 
-        // BGRA output texture (VP target + shader input)
-        {
-            D3D11_TEXTURE2D_DESC desc = {};
-            desc.Width = width; desc.Height = height;
-            desc.MipLevels = 1; desc.ArraySize = 1;
-            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            desc.SampleDesc.Count = 1;
-            desc.Usage = D3D11_USAGE_DEFAULT;
-            desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            hr = m_device->CreateTexture2D(&desc, nullptr, &m_vpBgraTex);
-            if (FAILED(hr)) { LOG_WARNING("VP: CreateTexture2D(BGRA) failed: 0x%08X", hr); return; }
-        }
+        // BT.709 color space
+        { D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCS={}; inCS.YCbCr_Matrix=1; inCS.Nominal_Range=1;
+          D3D11_VIDEO_PROCESSOR_COLOR_SPACE outCS={}; outCS.YCbCr_Matrix=0; outCS.Nominal_Range=0;
+          m_videoContext->VideoProcessorSetStreamColorSpace(m_videoProcessor,0,&inCS);
+          m_videoContext->VideoProcessorSetOutputColorSpace(m_videoProcessor,&outCS); }
 
-        // VP input view (NV12)
-        {
-            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
-            ivDesc.FourCC = 0;
-            ivDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-            ivDesc.Texture2D.MipSlice = 0;
-            ivDesc.Texture2D.ArraySlice = 0;
-            hr = m_videoDevice->CreateVideoProcessorInputView(
-                m_vpNv12Tex, m_vpEnumerator, &ivDesc, &m_vpInputView);
-            if (FAILED(hr)) { LOG_WARNING("VP: CreateVPInputView failed: 0x%08X", hr); return; }
-        }
-
-        // VP output view (BGRA)
-        {
-            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc = {};
-            ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-            hr = m_videoDevice->CreateVideoProcessorOutputView(
-                m_vpBgraTex, m_vpEnumerator, &ovDesc, &m_vpOutputView);
-            if (FAILED(hr)) { LOG_WARNING("VP: CreateVPOutputView failed: 0x%08X", hr); return; }
-        }
-
-        // SRV on BGRA output
-        hr = m_device->CreateShaderResourceView(m_vpBgraTex, nullptr, &m_vpBgraSRV);
-        if (FAILED(hr)) { LOG_WARNING("VP: CreateSRV(BGRA) failed: 0x%08X", hr); return; }
-
-        m_vpWidth = width;
-        m_vpHeight = height;
-
-        // BT.709 limited-range NV12 input → full-range BGRA output
-        {
-            D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCS = {};
-            inCS.YCbCr_Matrix   = 1;  // BT.709 (matches encoder output)
-            inCS.Nominal_Range  = 1;  // 16-235 limited range (TV levels)
-            D3D11_VIDEO_PROCESSOR_COLOR_SPACE outCS = {};
-            outCS.YCbCr_Matrix  = 0;  // BT.601 (ignored for RGB output)
-            outCS.Nominal_Range = 0;  // 0-255 full range (sRGB)
-            m_videoContext->VideoProcessorSetStreamColorSpace(m_videoProcessor, 0, &inCS);
-            m_videoContext->VideoProcessorSetOutputColorSpace(m_videoProcessor, &outCS);
-        }
-
-        LOG_INFO("RenderFrameNv12: Video Processor NV12→BGRA pipeline ready (%ux%u)", width, height);
+        m_vpWidth=width; m_vpHeight=height;
+        LOG_INFO("RenderFrameNv12: VP NV12→back-buffer pipeline ready (%ux%u)",width,height);
     }
 
-    // Copy decoder NV12 texture into staging texture.
-    {
-        D3D11_TEXTURE2D_DESC decDesc, vpDesc;
-        nv12Texture->GetDesc(&decDesc);
-        m_vpNv12Tex->GetDesc(&vpDesc);
+    // Copy decoder NV12 → staging
+    { D3D11_TEXTURE2D_DESC dd,vd; nv12Texture->GetDesc(&dd); m_vpNv12Tex->GetDesc(&vd);
+      if(dd.MipLevels==vd.MipLevels&&dd.ArraySize==vd.ArraySize)
+          m_context->CopyResource(m_vpNv12Tex,nv12Texture);
+      else{ D3D11_BOX b; b.left=0;b.top=0;b.front=0;b.right=width;b.bottom=height;b.back=1;
+            m_context->CopySubresourceRegion(m_vpNv12Tex,0,0,0,0,nv12Texture,0,&b);
+            b.right=(width+1)/2;b.bottom=(height+1)/2;
+            m_context->CopySubresourceRegion(m_vpNv12Tex,1,0,0,0,nv12Texture,1,&b); } }
 
-        if (decDesc.MipLevels == vpDesc.MipLevels && decDesc.ArraySize == vpDesc.ArraySize) {
-            m_context->CopyResource(m_vpNv12Tex, nv12Texture);
-        } else {
-            D3D11_BOX box;
-            box.left = 0; box.top = 0; box.front = 0;
-            box.right = width; box.bottom = height; box.back = 1;
-            m_context->CopySubresourceRegion(m_vpNv12Tex, 0, 0, 0, 0, nv12Texture, 0, &box);
-            box.right = (width + 1) / 2; box.bottom = (height + 1) / 2;
-            m_context->CopySubresourceRegion(m_vpNv12Tex, 1, 0, 0, 0, nv12Texture, 1, &box);
-        }
-    }
-
-    // Configure and execute VP blit (NV12 → BGRA).
-    RECT rc = { 0, 0, (LONG)width, (LONG)height };
-    m_videoContext->VideoProcessorSetStreamSourceRect(m_videoProcessor, 0, TRUE, &rc);
-    m_videoContext->VideoProcessorSetStreamDestRect(m_videoProcessor, 0, TRUE, &rc);
-
-    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
-    stream.Enable = TRUE;
-    stream.OutputIndex = 0;
-    stream.InputFrameOrField = 0;
-    stream.PastFrames = 0;
-    stream.FutureFrames = 0;
-    stream.ppPastSurfaces = nullptr;
-    stream.pInputSurface = m_vpInputView;
-    stream.ppFutureSurfaces = nullptr;
-
-    HRESULT hr = m_videoContext->VideoProcessorBlt(
-        m_videoProcessor, m_vpOutputView, 0, 1, &stream);
-    if (FAILED(hr)) {
-        static int vpBltFailCount = 0;
-        if (++vpBltFailCount <= 5) {
-            LOG_WARNING("VP: VideoProcessorBlt failed: 0x%08X (frame %ux%u)", hr, width, height);
-        }
-        return;
-    }
-
-    // Draw the BGRA output via the standard BGRA shader
-    UINT stride = sizeof(QuadVertex);
-    UINT offset = 0;
-    m_context->IASetVertexBuffers(0, 1, &m_quadVB, &stride, &offset);
-    m_context->IASetInputLayout(m_inputLayout);
-    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    m_context->VSSetShader(m_vertexShader, nullptr, 0);
-    m_context->PSSetShader(m_pixelShader, nullptr, 0);
-    m_context->PSSetShaderResources(0, 1, &m_vpBgraSRV);
-    m_context->PSSetSamplers(0, 1, &m_sampler);
-    m_context->OMSetRenderTargets(1, &m_rtv, nullptr);
-    m_context->Draw(3, 0);
+    // VP: NV12 → back buffer (single GPU blit, no extra Draw)
+    RECT rc={0,0,(LONG)width,(LONG)height};
+    m_videoContext->VideoProcessorSetStreamSourceRect(m_videoProcessor,0,TRUE,&rc);
+    m_videoContext->VideoProcessorSetStreamDestRect(m_videoProcessor,0,TRUE,&rc);
+    D3D11_VIDEO_PROCESSOR_STREAM s={}; s.Enable=TRUE; s.OutputIndex=0;
+    s.InputFrameOrField=0; s.PastFrames=0; s.FutureFrames=0;
+    s.ppPastSurfaces=nullptr; s.pInputSurface=m_vpInputView; s.ppFutureSurfaces=nullptr;
+    HRESULT hr=m_videoContext->VideoProcessorBlt(m_videoProcessor,m_vpOutputView,0,1,&s);
+    if(FAILED(hr)){ static int n=0; if(++n<=5)LOG_WARNING("VP: Blt failed: 0x%08X",hr); }
 }
 
 void D3d11Renderer::Present() {
