@@ -69,7 +69,7 @@ bool DxgiScreenCapture::Initialize(ID3D11Device* device, ID3D11DeviceContext* co
     LOG_INFO("DXGI screen capture initialized, %zu monitor(s)", m_monitors.size());
     return true;
 }
-
+//为指定输出索引初始化屏幕捕获复制接口，设置监视器描述，预分配安纹理池避免每帧创建纹理带来的GPU分配延迟
 bool DxgiScreenCapture::InitDuplicationForOutput(int outputIndex) {
     if (outputIndex < 0 || outputIndex >= static_cast<int>(m_monitors.size())) return false;
 
@@ -105,7 +105,7 @@ bool DxgiScreenCapture::InitDuplicationForOutput(int outputIndex) {
     mc.duplicateCount = 0;
     mc.prevSample.clear();
 
-    hr = output1->DuplicateOutput(m_device, &mc.duplication);
+    hr = output1->DuplicateOutput(m_device, &mc.duplication);//DXGI核心： 为每个监视器创建一个输出复制接口，允许捕获屏幕内容
     output1->Release();
 
     if (FAILED(hr)) {
@@ -201,10 +201,13 @@ bool DxgiScreenCapture::AcquireFrameGpu(CapturedFrameGpu& outFrame) {
     // encoder always has its full frame budget (16.67ms at 60fps). Without this,
     // frames can arrive in bursts that overflow the encoder queue.
     auto now = Timer::NowMs();
-    int64_t frameInterval = 1000 / m_targetFps;
+    int64_t frameInterval = 1000 / m_targetFps;//目标帧率的帧间隔时间(ms)
     int64_t elapsed = now - m_lastFrameTime;
     if (elapsed < frameInterval) {
-        Sleep(static_cast<DWORD>(frameInterval - elapsed));
+		Sleep(static_cast<DWORD>(frameInterval - elapsed));// static_cast用于大多数类型转换，提供编译时类型检查，但不执行运行时检查。
+                                                           // dynamic_cast用于多态类型之间的安全转换，提供运行时类型检查，适用于类层次结构。
+                                                           // const_cast用于添加或移除对象的const或volatile属性，不改变对象的实际类型。
+                                                           // reinterpret_cast用于低级别的指针或整数之间的转换，不进行任何检查，可能导致不可移植或不安全的代码。
     }
 
     if (AcquireFromMonitorGpu(0, outFrame)) {
@@ -335,7 +338,7 @@ bool DxgiScreenCapture::AcquireFromMonitor(int index, CapturedFrame& outFrame) {
 
     return SUCCEEDED(hr);
 }
-
+//直接从GPU获取屏幕内容，避免GPU->CPU的map读回操作导致的性能瓶颈
 bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFrame) {
     auto& mc = m_monitors[index];
     if (!mc.valid || !mc.duplication) return false;
@@ -349,7 +352,7 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
     // A 50ms timeout gives ~20 checks/sec for m_running during static
     // periods while naturally pacing to the DWM's VSync rate (60Hz =
     // 16.67ms) when content is changing.
-    HRESULT hr = mc.duplication->AcquireNextFrame(50, &frameInfo, &frameResource);
+    HRESULT hr = mc.duplication->AcquireNextFrame(50, &frameInfo, &frameResource);//从DXGI输出复制接口获取下一帧的资源和信息
 
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         static uint32_t timeoutLogCount = 0;
@@ -360,7 +363,7 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
     }
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         LOG_WARNING("DXGI access lost on monitor %d, reinitializing", index);
-        InitDuplicationForOutput(index);
+		InitDuplicationForOutput(index);//访问丢失通常是由于显示模式更改或系统睡眠引起的，重新初始化复制接口以恢复捕获
         return false;
     }
     if (FAILED(hr)) {
@@ -413,7 +416,7 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
     // captured frame. Map stalls serialize the capture and encode pipelines on
     // the shared immediate context, halving effective throughput.
     mc.frameCounter++;
-    if ((mc.frameCounter & 7) == 0) {
+    if ((mc.frameCounter & 7) == 0) {//1000 & 111 = 0
         D3D11_TEXTURE2D_DESC srcDesc;
         srcTexture->GetDesc(&srcDesc);
 
@@ -445,10 +448,10 @@ bool DxgiScreenCapture::AcquireFromMonitorGpu(int index, CapturedFrameGpu& outFr
             box.back   = 1;
 
             m_context->CopySubresourceRegion(mc.sampleStagingTex, 0, 0, 0, 0,
-                                             srcTexture, 0, &box);
+                                             srcTexture, 0, &box);//从捕获的帧中复制一个64x64的区域到sampleStagingTex，用于后续的像素比较
 
             D3D11_MAPPED_SUBRESOURCE mapped;
-            if (SUCCEEDED(m_context->Map(mc.sampleStagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+			if (SUCCEEDED(m_context->Map(mc.sampleStagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {//ID3D11DeviceContext::Map方法将sampleStagingTex纹理映射到CPU可访问的内存地址，允许我们读取像素数据进行比较    
                 size_t sampleSize = static_cast<size_t>(sampleW) * sampleH * 4;
                 bool identical = (mc.prevSample.size() == sampleSize);
 

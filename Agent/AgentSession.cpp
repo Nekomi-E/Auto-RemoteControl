@@ -59,7 +59,7 @@ bool AgentSession::Initialize(const AgentConfig& config) {
         LOG_ERROR("No monitors detected");
         m_running = false;
         m_network->Shutdown();
-        if (!m_threads.empty()) { m_threads[0].join(); m_threads.clear(); }
+        if (!m_threads.empty()) { m_threads[0].join(); m_threads.clear(); }//等待AcceptThread线程结束，清理线程池
         return false;
     }
     // Use primary monitor's dimensions for encoder init
@@ -121,7 +121,7 @@ void AgentSession::Run() {
 
     // Shutdown
     for (auto& t : m_threads) {
-        if (t.joinable()) t.join();
+		if (t.joinable()) t.join();//std::thread::joinable()函数用于检查线程对象是否可连接，即是否代表一个正在运行的线程。只有当线程对象确实代表一个线程时，才可以调用join()来等待该线程结束。这样可以避免在没有有效线程的情况下调用join()导致程序崩溃。
     }
 }
 
@@ -149,8 +149,8 @@ void AgentSession::AcceptThread() {
             // Process control messages while connected
             while (m_running && m_network->IsConnected()) {
 				auto msg = m_network->ReceiveControlMessage(100);//100ms 线程在没有消息时也能及时响应停止信号，同时避免长时间阻塞在ReceiveControlMessage中无法处理其他事件（如网络 disconnect）。如果改成完全阻塞等待，可能会导致在Viewer断开连接或Agent停止时，AcceptThread无法及时退出。不过100ms的等待确实可能引入一些输入响应延迟，可以考虑更短的等待时间或者使用事件驱动的方式来通知线程有新消息。
-				//TODO 利用事件驱动的方式通知线程有新消息，避免轮询等待带来的输入响应延迟
-                if (msg) {
+				//TODO 利用事件驱动的方式通知线程有新消息，避免轮询等待带来的输入响应延迟    ps2:但是这里好像并不重要，建立连接以后就跟着100ms毫无关系了
+                if (msg) {//主线程负责接收处理控制消息
                     if (msg->type == Protocol::MessageType::INPUT_EVENT) {
                         for (auto& ev : msg->inputEvents) {
                             m_inputQueue.tryPush(std::move(ev));
@@ -212,7 +212,7 @@ void AgentSession::CaptureThread() {
             bool submitted = m_encoderMgr->SubmitVideoFrameGpu(gpuFrame.texture,
                                                gpuFrame.width, gpuFrame.height, now);
             m_captureMgr->ReleaseGpuFrame();
-            if (!submitted) {
+            if (!submitted) {//编码器队列满，丢弃当前帧并继续
                 gpuFrame.texture->Release();
                 dropCount++;
                 intervalDrops++;
@@ -351,7 +351,7 @@ void AgentSession::NetworkSendThread() {
         // Periodic stats
         auto now = Timer::NowMs();
         if (now - lastStatsTime >= 5000) {
-            m_videoSent.store(videoSent);
+            m_videoSent.store(videoSent);//更新原子变量
             m_audioSent.store(audioSent);
             LOG_INFO("[NetworkSend] Sent: video=%u (fail=%u) audio=%u queue=%zu",
                      videoSent, videoFail, audioSent, m_videoSendQueue.size());
@@ -383,7 +383,7 @@ void AgentSession::StatsThread() {
         auto capStats = m_captureMgr ? m_captureMgr->GetStats() : CaptureManager::Stats{};
         auto encStats = m_encoderMgr ? m_encoderMgr->GetStats() : EncoderManager::Stats{};
 
-        uint32_t videoSentNow = m_videoSent.load();
+		uint32_t videoSentNow = m_videoSent.load();//从原子变量中读取当前已发送的视频帧数
         uint32_t audioSentNow = m_audioSent.load();
         float sendFps = (videoSentNow - lastVideoSent) / 5.0f;
 

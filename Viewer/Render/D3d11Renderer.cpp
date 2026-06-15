@@ -449,7 +449,7 @@ void D3d11Renderer::Resize(uint32_t width, uint32_t height) {
     m_context->RSSetViewports(1, &vp);
 }
 
-void D3d11Renderer::RenderFrame(const uint8_t* rgbaData, uint32_t width, uint32_t height) {
+void D3d11Renderer::RenderFrame(const uint8_t* rgbaData, uint32_t width, uint32_t height) {//RenderFrame函数还可以极限性能优化，减少不必要的状态设置和资源 updates（例如当视频尺寸不变时跳过纹理重建，或者当视频覆盖整个屏幕时跳过 ClearRenderTargetView）
     if (!m_device || !m_context || !m_rtv) return;
 
     if (rgbaData && width > 0 && height > 0) {

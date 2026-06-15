@@ -31,7 +31,7 @@ struct EncoderManager::Impl {
     ThreadSafeQueue<RawAudioFrame> audioInputQueue{16};
 
     // Encoded output queues
-    ThreadSafeQueue<EncodedFrame> videoOutputQueue{48};
+    ThreadSafeQueue<EncodedFrame> videoOutputQueue{48};//视频编码可能产生较大延迟，允许更多待发送帧积压
     ThreadSafeQueue<EncodedFrame> audioOutputQueue{32};
 
     // Worker threads
@@ -189,7 +189,7 @@ void EncoderManager::SubmitVideoFrame(std::vector<uint8_t> rawData,
     rf.timestampMs = timestampMs;
     m_impl->videoInputQueue.tryPush(std::move(rf));
 }
-
+//提交GPU纹理帧
 bool EncoderManager::SubmitVideoFrameGpu(ID3D11Texture2D* gpuTexture,
                                          uint32_t width, uint32_t height,
                                          int64_t timestampMs) {

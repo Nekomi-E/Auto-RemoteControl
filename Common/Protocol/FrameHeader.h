@@ -25,7 +25,7 @@ struct FragmentHeader {
     uint16_t fragmentId;       // same for all fragments of one frame
     uint16_t fragmentIndex;    // 0-based index
     uint16_t totalFragments;   // total number of fragments
-    static constexpr size_t WireSize = 6;
+	static constexpr size_t WireSize = 6;//分片头部     占6字节：2字节fragmentId + 2字节fragmentIndex + 2字节totalFragments
 };
 
 #pragma pack(push, 1)

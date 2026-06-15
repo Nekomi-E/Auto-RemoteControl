@@ -63,19 +63,19 @@ bool MfAudioEncoder::InitMFT(bool softwareOnly) {
     if (!softwareOnly) {
         // Try hardware encoder first
         hr = MFTEnumEx(MFT_CATEGORY_AUDIO_ENCODER,
-                        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT,
+			            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT,//枚举系统中所有符合条件的AAC硬件编码器
                         &inputInfo, &outputInfo,
-                        &activates, &count);
+                        &activates, &count);//枚举系统中所有符合条件的AAC硬件编码器
     }
 
     if (softwareOnly || FAILED(hr) || count == 0) {
         // Fall back to any sync encoder (no filtering — first attempt needs any encoder)
         if (!softwareOnly && count > 0) {
-            for (UINT32 i = 0; i < count; ++i) activates[i]->Release();
+            for (UINT32 i = 0; i < count; ++i) activates[i]->Release();//释放之前枚举到的硬件编码器对象
             CoTaskMemFree(activates);
         }
         hr = MFTEnumEx(MFT_CATEGORY_AUDIO_ENCODER,
-                       MFT_ENUM_FLAG_SYNCMFT,
+                       MFT_ENUM_FLAG_SYNCMFT,//枚举系统中所有符合条件的AAC软件编码器
                        &inputInfo, &outputInfo,
                        &activates, &count);
 
@@ -84,7 +84,7 @@ bool MfAudioEncoder::InitMFT(bool softwareOnly) {
             UINT32 swCount = 0;
             for (UINT32 i = 0; i < count; ++i) {
                 UINT32 d3dAware = 0;
-                HRESULT hrAttr = activates[i]->GetUINT32(MF_SA_D3D11_AWARE, &d3dAware);
+                HRESULT hrAttr = activates[i]->GetUINT32(MF_SA_D3D11_AWARE, &d3dAware);//若编码器对象支持D3D11，视其为硬件编码器，过滤掉
                 if (FAILED(hrAttr) || d3dAware == 0) {
                     if (swCount != i) activates[swCount] = activates[i];
                     ++swCount;
@@ -108,7 +108,7 @@ bool MfAudioEncoder::InitMFT(bool softwareOnly) {
     LOG_INFO("Found %u AAC encoder candidate(s)%s", count,
              softwareOnly ? " (software-only)" : "");
 
-    hr = activates[0]->ActivateObject(IID_PPV_ARGS(&m_impl->mft));
+    hr = activates[0]->ActivateObject(IID_PPV_ARGS(&m_impl->mft));//激活第一个编码器对象，获取IMFTransform接口指针
     for (UINT32 i = 0; i < count; ++i) activates[i]->Release();
     CoTaskMemFree(activates);
 

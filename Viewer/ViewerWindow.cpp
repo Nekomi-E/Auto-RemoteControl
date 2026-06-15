@@ -76,8 +76,8 @@ bool ViewerWindow::Create(HINSTANCE hInstance, uint32_t width, uint32_t height, 
 
     RegisterRawInput();
 
-    ShowWindow(m_hwnd, SW_SHOW);
-    UpdateWindow(m_hwnd);
+    ShowWindow(m_hwnd, SW_SHOW);//显示窗口
+    UpdateWindow(m_hwnd);//强制窗口重绘
 
     LOG_INFO("Viewer window created: %ux%u", width, height);
     return true;
@@ -98,7 +98,7 @@ void ViewerWindow::RegisterRawInput() {
     rid[1].dwFlags = RIDEV_INPUTSINK;
     rid[1].hwndTarget = m_hwnd;
 
-    RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));
+    RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));//注册原始输入设备，使窗口能接收键盘/鼠标输入 (即便窗口不在前台)
 }
 
 void ViewerWindow::SetInputActive(bool active) {
@@ -119,12 +119,12 @@ void ViewerWindow::SetInputActive(bool active) {
         ReleaseCapture();
         ShowCursor(TRUE);
         ClipCursor(nullptr);
+        m_lastScrollLock = false;  // reset so next Scroll Lock press activates correctly
     }
 }
 
 void ViewerWindow::ProcessPendingEvents(ViewerSession& session) {
     // Check for Scroll Lock toggle to activate/deactivate input mode
-    static bool lastScrollLock = false;
     bool scrollLock = (GetKeyState(VK_SCROLL) & 1) != 0;
 
     if (scrollLock != m_lastScrollLock) {

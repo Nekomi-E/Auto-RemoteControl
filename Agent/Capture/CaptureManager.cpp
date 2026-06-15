@@ -56,7 +56,7 @@ bool CaptureManager::Initialize(uint32_t targetFps) {
     IDXGIAdapter* chosenAdapter = nullptr;
     {
         IDXGIFactory1* factory = nullptr;
-        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) {
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) {//创建DXGI工厂对象，用于枚举适配器和输出
             IDXGIAdapter1* adap = nullptr;
             for (UINT i = 0; factory->EnumAdapters1(i, &adap) != DXGI_ERROR_NOT_FOUND; ++i) {
                 IDXGIOutput* out = nullptr;
@@ -71,13 +71,13 @@ bool CaptureManager::Initialize(uint32_t targetFps) {
 
                 if (hasOutputs && !chosenAdapter) {
                     chosenAdapter = adap;
-                    chosenAdapter->AddRef();
+                    chosenAdapter->AddRef();//AddRef: 增加COM对象的引用计数，确保后续使用时对象没有被释放
                 }
                 adap->Release();
             }
             factory->Release();
         }
-    }
+	}//确定性资源管理风格：COM对象一旦不再需要就立即释放
 
     HRESULT hr = D3D11CreateDevice(chosenAdapter,
                                     chosenAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
@@ -85,7 +85,7 @@ bool CaptureManager::Initialize(uint32_t targetFps) {
                                     featureLevels, ARRAYSIZE(featureLevels),
                                     D3D11_SDK_VERSION,
                                     &m_impl->d3dDevice, nullptr, &m_impl->d3dContext);
-    if (chosenAdapter) chosenAdapter->Release();
+    if (chosenAdapter) chosenAdapter->Release();//已经选定适配器，直接释放引用计数
 
     if (FAILED(hr)) {
         LOG_ERROR("D3D11CreateDevice failed: 0x%08X", hr);
@@ -101,7 +101,7 @@ bool CaptureManager::Initialize(uint32_t targetFps) {
             if (SUCCEEDED(dxgiDev->GetAdapter(&adap))) {
                 DXGI_ADAPTER_DESC desc;
                 if (SUCCEEDED(adap->GetDesc(&desc))) {
-                    LOG_INFO("D3D11 device created on: %S", desc.Description);
+                    LOG_INFO_GREEN("D3D11 device created on: %S", desc.Description);
                 }
                 adap->Release();
             }
@@ -115,7 +115,7 @@ bool CaptureManager::Initialize(uint32_t targetFps) {
     {
         ID3D10Multithread* mt = nullptr;
         if (SUCCEEDED(m_impl->d3dDevice->QueryInterface(IID_ID3D10Multithread, (void**)&mt))) {
-            mt->SetMultithreadProtected(TRUE);
+            mt->SetMultithreadProtected(TRUE);//开启多线程保护，确保同一D3D11设备上下文在多个线程之间安全访问
             mt->Release();
             LOG_INFO("D3D11 multithread protection enabled (Agent)");
         }
@@ -184,7 +184,7 @@ bool CaptureManager::AcquireFrame(std::vector<uint8_t>& outData, uint32_t& width
 bool CaptureManager::AcquireFrameGpu(CapturedFrameGpu& outFrame) {
     if (!m_impl->running || !m_impl->screenCapture) return false;
 
-    if (!m_impl->screenCapture->AcquireFrameGpu(outFrame))
+    if (!m_impl->screenCapture->AcquireFrameGpu(outFrame))//尝试通过GPU路径获取捕获帧，若失败则返回false
         return false;
 
     m_impl->capturedFrames++;
@@ -192,7 +192,7 @@ bool CaptureManager::AcquireFrameGpu(CapturedFrameGpu& outFrame) {
 
     auto now = Timer::NowMs();
     auto elapsed = now - m_impl->lastStatsTime;
-    if (elapsed >= 1000) {
+    if (elapsed >= 1000) {//每秒更新一次捕获帧率统计
         m_impl->captureFps = m_impl->framesSinceLastStats * 1000.0f / elapsed;
         m_impl->framesSinceLastStats = 0;
         m_impl->lastStatsTime = now;

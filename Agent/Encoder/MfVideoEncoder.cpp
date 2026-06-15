@@ -82,7 +82,7 @@ bool MfVideoEncoder::SetupEncoderCandidate(
 
     HRESULT hr = E_FAIL;
     __try {
-        hr = activate->ActivateObject(IID_PPV_ARGS(&impl->mft));
+		hr = activate->ActivateObject(IID_PPV_ARGS(&impl->mft));//激活编码器对象，获取IMFTransform接口指针
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG_WARNING("  Encoder #%u: ActivateObject crashed (exception 0x%08X)",
                     idx, GetExceptionCode());
@@ -211,7 +211,7 @@ bool MfVideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
     m_impl->fps = fps;
     m_impl->quality = quality;
 
-    HRESULT hr = MFStartup(MF_VERSION);
+    HRESULT hr = MFStartup(MF_VERSION);//初始化Media Foundation平台
     if (FAILED(hr)) {
         LOG_ERROR("MFStartup failed: 0x%08X", hr);
         return false;
@@ -224,9 +224,9 @@ bool MfVideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
         m_impl->d3dDevice = d3dDevice;
         m_impl->d3dContext = d3dContext;
         HRESULT hrDm = MFCreateDXGIDeviceManager(&m_impl->deviceResetToken,
-                                                  &m_impl->deviceManager);
+                                                  &m_impl->deviceManager);//创建D3D设备管理器，用于在Media Foundation中共享D3D设备
         if (SUCCEEDED(hrDm)) {
-            hrDm = m_impl->deviceManager->ResetDevice(d3dDevice, m_impl->deviceResetToken);
+            hrDm = m_impl->deviceManager->ResetDevice(d3dDevice, m_impl->deviceResetToken);//将D3D设备与设备管理器关联
             if (SUCCEEDED(hrDm)) {
                 LOG_INFO("D3D11 device manager created from capture device");
             } else {
@@ -257,7 +257,7 @@ bool MfVideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
         if (SUCCEEDED(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
                                  MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT,
                                  &hevcInput, &hevcOutput,
-                                 &hevcHwActivates, &hevcHwCount)) && hevcHwCount > 0) {
+                                 &hevcHwActivates, &hevcHwCount)) && hevcHwCount > 0) {//枚举系统中所有符合条件的HEVC硬件编码器
             for (UINT32 i = 0; i < hevcHwCount && !configured; ++i) {
                 WCHAR* name = nullptr;
                 UINT32 nameLen = 0;
@@ -265,7 +265,7 @@ bool MfVideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
                         MFT_FRIENDLY_NAME_Attribute, &name, &nameLen))) {
                     LOG_INFO("  HEVC encoder candidate #%u: %S", i, name);
                 }
-
+                //配置新编码器之前，先清理上一个编码器的相关资源
                 if (m_impl->mft) { m_impl->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0); m_impl->mft->Release(); m_impl->mft = nullptr; }
                 if (m_impl->inputType) { m_impl->inputType->Release(); m_impl->inputType = nullptr; }
                 if (m_impl->outputType) { m_impl->outputType->Release(); m_impl->outputType = nullptr; }
@@ -1435,7 +1435,7 @@ bool MfVideoEncoder::ConvertTextureToNv12Gpu(Impl* impl, ID3D11Texture2D* bgraTe
     mediaBuffer->Release();
     return true;
 }
-
+//使用GPU视频处理器进行BGRA→NV12转换并编码帧数据，返回编码后的比特流和关键帧标志
 bool MfVideoEncoder::EncodeFrameGpu(ID3D11Texture2D* bgraTexture,
                                      uint32_t width, uint32_t height,
                                      std::vector<uint8_t>& outBitstream,
@@ -1612,7 +1612,7 @@ bool MfVideoEncoder::ProcessInput(const uint8_t* rawFrame, uint32_t width, uint3
 
     return SUCCEEDED(hr);
 }
-
+//从编码器MFT获取输出数据，提取H.264比特流并检查关键帧标志
 bool MfVideoEncoder::ProcessOutput(std::vector<uint8_t>& outBitstream, bool& outIsKeyFrame) {
     outBitstream.clear();
 

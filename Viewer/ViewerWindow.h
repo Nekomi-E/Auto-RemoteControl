@@ -28,4 +28,5 @@ private:
     uint32_t m_height = 0;
     bool m_fullscreen = false;
     bool m_inputActive = false;
+    bool m_lastScrollLock = false;  // tracks Scroll Lock toggle across focus changes
 };

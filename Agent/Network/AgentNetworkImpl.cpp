@@ -121,7 +121,7 @@ bool AgentNetworkImpl::AcceptConnection(int timeoutMs) {
     pfd.events = POLLRDNORM;
     pfd.revents = 0;
 
-    int result = WSAPoll(&pfd, 1, timeoutMs);//WSAPoll监视套接字的状态，等待期间当前线程也处于可提醒状态，可以同时监视多个套接字，但是不会处理连接请求，只是通知哪个套接字有事件发生。只有当监听套接字上有可读事件（POLLRDNORM）时，才表示有新的连接请求到达，此时才调用accept函数接受连接。
+    int result = WSAPoll(&pfd, 1, timeoutMs);//WSAPoll监视套接字的状态，等待期间当前线程也处于可提醒状态，可以同时监视多个套接字，但是不会处理连接请求，只是通知哪个套接字有事件发生。只有当监听套接字上有可读事件（POLLRDNORM）时，才表示有新的连接请求到达，此时WSAPoll函数才会返回，并且pfd.revents会包含POLLRDNORM标志，表示监听套接字上有可读事件，可以调用accept函数接受新的连接请求
     if (result <= 0) {
         if (result == SOCKET_ERROR) {
             LOG_ERROR("[Accept] WSAPoll error: %d", WSAGetLastError());
@@ -281,7 +281,7 @@ std::optional<Protocol::ControlMessage> AgentNetworkImpl::ReceiveControlMessage(
 
     // Read 4-byte length prefix
     uint8_t lenBuf[4];
-    int received = recv(m_tcpClient, (char*)lenBuf, 4, MSG_WAITALL);//接收前4字节数据，表示后续消息体的长度。
+    int received = recv(m_tcpClient, (char*)lenBuf, 4, MSG_WAITALL);//接收前4字节数据，表示后续消息体的长度。//这里recv函数实际上读取的是TCP套接字的接收缓冲区中的数据，而接受网络数据包并且写缓冲区的过程是由操作系统内核负责的
     if (received != 4) return std::nullopt;
 
     uint32_t msgLen = (static_cast<uint32_t>(lenBuf[0]) << 24)
@@ -319,7 +319,7 @@ bool AgentNetworkImpl::SendDataFrame(Protocol::FrameType type, uint16_t seq,
         header.timestampMs = timestampMs;
         header.payloadSize = static_cast<uint16_t>(payloadSize);
 
-        const uint8_t* sendPayload = payload;
+		const uint8_t* sendPayload = payload;//默认发送负载是原始负载数据
         size_t sendPayloadSize = payloadSize;
 
         if (m_encrypted && m_secureChannel) {//如果启用了加密并且安全通道已经建立，则对整个负载进行加密，并将加密后的数据作为发送负载
@@ -347,10 +347,10 @@ bool AgentNetworkImpl::SendDataFrame(Protocol::FrameType type, uint16_t seq,
     }
 
     // Fragment large payload: split first, then encrypt each fragment
-    uint16_t totalFrags = static_cast<uint16_t>((payloadSize + MAX_FRAG_DATA - 1) / MAX_FRAG_DATA);
+	uint16_t totalFrags = static_cast<uint16_t>((payloadSize + MAX_FRAG_DATA - 1) / MAX_FRAG_DATA);//    + MAX_FRAG_DATA - 1 : 实现向上取整，确保即使payloadSize不是MAX_FRAG_DATA的整数倍，也能正确计算出需要的分片数量
     uint16_t fragId = seq;
 
-    static bool loggedOnce = false;
+	static bool loggedOnce = false;//静态局部变量，作用域仅限于函数内部，但在寒暑表用之间保持其值。 局部静态变量和全局静态变量的区别在于，局部静态变量只能在定义它的函数内部访问，而全局静态变量可以在定义它的文件内的任何地方访问，但不能被其他文件访问。生命周期一致，都是程序运行期间
     if (!loggedOnce) {
         LOG_INFO("[SendDataFrame] Fragmenting %u bytes into %u fragments", payloadSize, totalFrags);
         loggedOnce = true;
@@ -361,8 +361,8 @@ bool AgentNetworkImpl::SendDataFrame(Protocol::FrameType type, uint16_t seq,
     fragPrefix.reserve(Protocol::FragmentHeader::WireSize + MAX_FRAG_DATA);
 
     for (uint16_t i = 0; i < totalFrags; i++) {
-        size_t offset = static_cast<size_t>(i) * MAX_FRAG_DATA;
-        size_t chunkSize = (offset + MAX_FRAG_DATA <= payloadSize) ? MAX_FRAG_DATA : (payloadSize - offset);
+		size_t offset = static_cast<size_t>(i) * MAX_FRAG_DATA;//计算当前分片在原始负载中的偏移量
+		size_t chunkSize = (offset + MAX_FRAG_DATA <= payloadSize) ? MAX_FRAG_DATA : (payloadSize - offset);//计算当前分片的数据大小，最后一个分片可能小于MAX_FRAG_DATA
 
         // Build fragment prefix: FragmentHeader (6 bytes) + chunk data
         fragPrefix.resize(Protocol::FragmentHeader::WireSize + chunkSize);

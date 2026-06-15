@@ -43,21 +43,21 @@ bool WasapiAudioCapture::Initialize(uint32_t sampleRate, uint16_t channels) {
     m_impl->frameSize = channels * 2; // 16-bit
 
     HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
-                                   IID_IMMDeviceEnumerator, (void**)&m_impl->enumerator);
+                                   IID_IMMDeviceEnumerator, (void**)&m_impl->enumerator);//创建MMDeviceEnumerator实例，用于枚举音频设备
     if (FAILED(hr)) {
         LOG_WARNING("Failed to create MMDeviceEnumerator: 0x%08X", hr);
         return false;
     }
 
     // Get default audio render endpoint for loopback capture
-    hr = m_impl->enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &m_impl->device);
+    hr = m_impl->enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &m_impl->device);//获取默认音频渲染端点设备，用于环回捕获
     if (FAILED(hr)) {
         LOG_WARNING("Failed to get default audio endpoint: 0x%08X", hr);
         return false;
     }
 
     hr = m_impl->device->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr,
-                                   (void**)&m_impl->audioClient);
+                                   (void**)&m_impl->audioClient);//激活音频客户端接口，用于控制音频流和获取捕获数据
     if (FAILED(hr)) {
         LOG_WARNING("Failed to activate audio client: 0x%08X", hr);
         return false;
@@ -81,7 +81,7 @@ bool WasapiAudioCapture::Initialize(uint32_t sampleRate, uint16_t channels) {
                                           AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                           1000000, // 1 second buffer
                                           0,
-                                          &wf.Format, nullptr);
+                                          &wf.Format, nullptr);//尝试使用环回模式和事件驱动缓冲区初始化音频客户端，设置共享模式、流标志、缓冲区持续时间和格式
     if (FAILED(hr)) {
         // Retry without event callback
         hr = m_impl->audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
@@ -95,13 +95,13 @@ bool WasapiAudioCapture::Initialize(uint32_t sampleRate, uint16_t channels) {
     }
 
     hr = m_impl->audioClient->GetService(IID_IAudioCaptureClient,
-                                          (void**)&m_impl->captureClient);
+                                          (void**)&m_impl->captureClient);//获取音频捕获客户端接口，用于从音频流中读取捕获数据
     if (FAILED(hr)) {
         LOG_WARNING("Failed to get capture client: 0x%08X", hr);
         return false;
     }
 
-    m_impl->audioClient->Start();
+	m_impl->audioClient->Start();//启动音频客户端，开始捕获音频数据
     m_impl->running = true;
     m_initialized = true;
     LOG_INFO("WASAPI audio capture started: %uHz, %u channels", sampleRate, channels);

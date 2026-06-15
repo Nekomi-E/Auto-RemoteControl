@@ -149,7 +149,7 @@ void ViewerSession::RenderFrame() {
         std::lock_guard lock(m_frameMutex);
         if (m_latestFrame.nv12Texture) {
             nv12Tex = m_latestFrame.nv12Texture;
-            nv12Tex->AddRef();
+            nv12Tex->AddRef();//AddRef函数增加引用计数，确保在RenderFrame结束前纹理不会被释放
             nv12W = m_latestFrame.width;
             nv12H = m_latestFrame.height;
         } else if (m_latestFrame.width > 0 && !m_latestFrame.data.empty()) {
@@ -367,7 +367,7 @@ void ViewerSession::NetworkReceiveThread() {
                     debugSaveCount++;
                 }
 
-                VideoPacket vp;
+                VideoPacket vp;//vp接管packet.data的所有权，延长生命周期直到视频解码线程处理完毕
                 vp.data = std::move(packet.data);
                 vp.isKeyFrame = (packet.type == Protocol::FrameType::VIDEO_KEYFRAME);
                 vp.timestampMs = packet.timestampMs;
@@ -396,7 +396,7 @@ void ViewerSession::NetworkReceiveThread() {
         }
 
         // Check for incoming control messages
-        auto ctrlMsg = m_network->ReceiveControlMessage(1);
+        auto ctrlMsg = m_network->ReceiveControlMessage(1);//目前控制消息很少，若后续增多可以改为专门的线程处理
         if (ctrlMsg && ctrlMsg->type == Protocol::MessageType::SESSION_STOP) {
             LOG_INFO("[NetRecv] Remote session ended");
             m_running = false;
@@ -470,17 +470,20 @@ void ViewerSession::VideoDecodeThread() {
                              width, height, vp->isKeyFrame, vp->data.size());
                 }
 
-                // DEBUG: Save decoded RGBA frame to BMP every ~5 seconds (up to 10)
+                // DEBUG: Save decoded RGBA frame to BMP every ~5 seconds (up to 10).
+                // Copy under mutex to avoid data race with the render thread.
                 auto now = Timer::NowMs();
                 if (debugSaveCount < 10 && (debugSaveCount == 0 || now - lastDebugSaveMs >= 5000)) {
                     lastDebugSaveMs = now;
                     debugSaveCount++;
-                    std::vector<uint8_t> copyForSave = m_latestFrame.data;
-                    std::thread([](std::vector<uint8_t> data, uint32_t w, uint32_t h, uint32_t cnt) {
-                        char prefix[64];
-                        snprintf(prefix, sizeof(prefix), "viewer_decoded_%u", cnt);
-                        SaveBmp(prefix, data.data(), w, h, false);
-                    }, std::move(copyForSave), m_latestFrame.width, m_latestFrame.height, debugSaveCount).detach();
+                    // Capture a copy inside the lock to avoid racing with RenderFrame
+                    std::vector<uint8_t> copyForSave;
+                    {
+                        std::lock_guard lock2(m_frameMutex);
+                        copyForSave = m_latestFrame.data;
+                    }
+                    SaveBmp("viewer_decoded", copyForSave.data(),
+                            m_latestFrame.width, m_latestFrame.height, false);
                 }
             } else {
                 fails++;
