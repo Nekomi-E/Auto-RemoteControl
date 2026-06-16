@@ -198,6 +198,10 @@ void ViewerSession::RenderFrame() {
     }
 
     if (nv12Tex) {
+        // VP path: NV12→BGRA via D3D11 Video Processor (hardware color conversion).
+        // The NV12 pixel-shader path is faster but GPU-dependent — the UV channel
+        // mapping (R=U/G=V vs R=V/G=U) varies across GPU vendors and driver versions.
+        // The VP path handles colors correctly on all hardware.
         m_renderer->RenderFrameNv12(nv12Tex, nv12W, nv12H);
         nv12Tex->Release();
     } else if (!cpuFrame.empty()) {
@@ -206,7 +210,8 @@ void ViewerSession::RenderFrame() {
 
     // Render overlay — show actual decoded video FPS, not network packet rate
     m_overlay->Draw(m_displayFps,
-                    m_network ? m_network->IsConnected() : false);
+                    m_network ? m_network->IsConnected() : false,
+                    m_inputActive.load());
 
     // Present
     m_renderer->Present();
@@ -499,7 +504,10 @@ void ViewerSession::VideoDecodeThread() {
     uint32_t debugSaveCount = 0;
 
     while (m_running) {
-        auto vp = m_videoQueue.tryPop(50);
+        // 5ms timeout — at 120 fps a new frame arrives every ~8.3 ms.
+        // A 5 ms poll ensures the decode thread starts work within one
+        // frame interval.  (Was 50 ms, tuned for ≤60 fps.)
+        auto vp = m_videoQueue.tryPop(5);
         if (!vp) continue;
 
         // Log occasional debug info when packets are being consumed to help

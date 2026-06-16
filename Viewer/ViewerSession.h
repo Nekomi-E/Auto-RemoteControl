@@ -70,7 +70,7 @@ private:
         uint32_t height = 0;
     };
 
-    ThreadSafeQueue<VideoPacket> m_videoQueue{96};
+    ThreadSafeQueue<VideoPacket> m_videoQueue{192};  // ~1.6s @ 120fps (was 96)
     ThreadSafeQueue<AudioPacket> m_audioQueue{128};
     ThreadSafeQueue<Protocol::InputEvent> m_inputSendQueue{64};
 

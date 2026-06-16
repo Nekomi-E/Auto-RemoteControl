@@ -28,12 +28,21 @@ bool DataChannel::SendFrame(SOCKET sock, const sockaddr_in& dest,
     }
 
     auto headerBytes = header.serialize();
-    std::vector<uint8_t> packet;
-    packet.reserve(headerBytes.size() + finalPayloadSize);
-    packet.insert(packet.end(), headerBytes.begin(), headerBytes.end());
-    packet.insert(packet.end(), finalPayload, finalPayload + finalPayloadSize);
+    size_t totalSize = headerBytes.size() + finalPayloadSize;
 
-    int sent = sendto(sock, (const char*)packet.data(), (int)packet.size(), 0,
+    // Pre-allocated send buffer — amortises the per-frame heap allocation.
+    // At 120 fps with ~100 KB frames this saves ~120 allocations/s and the
+    // associated malloc/free overhead.  The buffer only resizes when a
+    // larger-than-ever frame arrives (first frame, resolution change).
+    // Per Sunshine: S/G I/O eliminates intermediate copies entirely;
+    // this is the simpler equivalent for sendto-based UDP.
+    if (m_sendBuffer.size() < totalSize) {
+        m_sendBuffer.resize(totalSize);
+    }
+    memcpy(m_sendBuffer.data(), headerBytes.data(), headerBytes.size());
+    memcpy(m_sendBuffer.data() + headerBytes.size(), finalPayload, finalPayloadSize);
+
+    int sent = sendto(sock, (const char*)m_sendBuffer.data(), (int)totalSize, 0,
                       (const sockaddr*)&dest, sizeof(dest));
-    return sent == static_cast<int>(packet.size());
+    return sent == static_cast<int>(totalSize);
 }

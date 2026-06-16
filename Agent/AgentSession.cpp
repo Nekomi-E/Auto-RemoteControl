@@ -197,6 +197,10 @@ void AgentSession::CaptureThread() {
         m_captureMgr->SetTargetFps(500);
     }
 
+    // Track inter-frame gaps for FPS diagnostics
+    int64_t intervalMinGap = INT64_MAX, intervalMaxGap = 0;
+    int64_t intervalGapSum = 0;
+
     while (m_running) {
         if (!m_clientConnected) {
             Sleep(50);
@@ -212,12 +216,19 @@ void AgentSession::CaptureThread() {
             }
             auto now = Timer::NowMs();
 
-            // Log inter-frame gap if unusually large (>33ms = <30fps)
+            // Track inter-frame gap statistics for FPS diagnostics.
+            // At 120 fps the expected gap is ~8.3 ms (60 Hz monitor = ~16.7 ms).
             if (lastFrameMs > 0) {
                 int64_t gap = now - lastFrameMs;
+                if (gap < intervalMinGap) intervalMinGap = gap;
+                if (gap > intervalMaxGap) intervalMaxGap = gap;
+                intervalGapSum += gap;
                 static uint32_t gapLogCount = 0;
-                if (gap > 33 && (gapLogCount++ & 0x1F) == 0) {
-                    LOG_WARNING("[Capture] inter-frame gap %lldms (%.1f fps equiv)", gap, 1000.0/gap);
+                // Log gaps >20ms as warning (120fps target is 8.3ms)
+                if (gap > 20 && (gapLogCount++ & 0x1F) == 0) {
+                    LOG_WARNING("[Capture] inter-frame gap %lldms (%.1f fps equiv) — "
+                               "target FPS %u may exceed display refresh rate",
+                               gap, 1000.0/gap, m_config.targetFps);
                 }
             }
             lastFrameMs = now;
@@ -225,7 +236,7 @@ void AgentSession::CaptureThread() {
             bool submitted = m_encoderMgr->SubmitVideoFrameGpu(gpuFrame.texture,
                                                gpuFrame.width, gpuFrame.height, now);
             m_captureMgr->ReleaseGpuFrame();
-            if (!submitted) {//编码器队列满，丢弃当前帧并继续
+            if (!submitted) {
                 gpuFrame.texture->Release();
                 dropCount++;
                 intervalDrops++;
@@ -237,20 +248,29 @@ void AgentSession::CaptureThread() {
             continue;
         }
 
-        // No new/different frame available (desktop is static or DXGI returned
-        // a duplicate).  AcquireFrameGpu already has a 50ms internal timeout
-        // on AcquireNextFrame, so we only reach here when the desktop is truly
-        // idle.  A 2ms yield is sufficient — shorter than the pacing interval
-        // (8ms @ 120fps) but long enough to avoid busy-spinning.
+        // No new/different frame available — desktop is static or DXGI returned duplicate.
         Sleep(2);
 
         // Per-interval diagnostics every 5 seconds
         auto now = Timer::NowMs();
         if (now - lastDiagTime >= 5000) {
-            LOG_INFO("[Capture] interval: %u captured, %u dropped, %u total",
-                     intervalFrames, intervalDrops, frameCount);
+            float actualFps = (intervalFrames > 0 && intervalGapSum > 0)
+                ? (intervalFrames * 1000.0f / static_cast<float>(intervalGapSum))
+                : 0.0f;
+            float avgGap = (intervalFrames > 1)
+                ? (static_cast<float>(intervalGapSum) / (intervalFrames - 1))
+                : 0.0f;
+            LOG_INFO("[Capture] %u frames in 5s (%.1f fps actual) | "
+                     "gap min=%lld avg=%.1f max=%lld ms | "
+                     "drops=%u total=%u",
+                     intervalFrames, actualFps,
+                     intervalMinGap, avgGap, intervalMaxGap,
+                     intervalDrops, frameCount);
             intervalFrames = 0;
             intervalDrops = 0;
+            intervalMinGap = INT64_MAX;
+            intervalMaxGap = 0;
+            intervalGapSum = 0;
             lastDiagTime = now;
         }
     }
@@ -298,7 +318,9 @@ void AgentSession::NetworkSendThread() {
         // Send video frames (higher priority)
         // Receives EncodedFrame directly from EncoderManager (via direct output queue),
         // eliminating the former VideoEncodeThread relay hop.
-        auto vf = m_videoSendQueue.tryPop(10);
+        // 3ms timeout — at 120 fps frame interval is ~8.3 ms; keep the
+        // send queue drained so frames don't accumulate.  (Was 10 ms.)
+        auto vf = m_videoSendQueue.tryPop(3);
         if (vf) {
             Protocol::FrameType type = vf->isKeyFrame
                 ? Protocol::FrameType::VIDEO_KEYFRAME

@@ -13,7 +13,7 @@ public:
 
     bool Initialize(HWND hwnd, ID2D1DeviceContext* d2dContext);
     void Shutdown();
-    void Draw(float fps, bool connected);
+    void Draw(float fps, bool connected, bool inputActive);
 
 private:
     void CreateBrushes();

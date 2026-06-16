@@ -27,11 +27,11 @@ struct EncoderManager::Impl {
         int64_t timestampMs = 0;
     };
 
-    ThreadSafeQueue<RawVideoFrame> videoInputQueue{48};  // ~400ms @ 120fps
+    ThreadSafeQueue<RawVideoFrame> videoInputQueue{96};  // ~800ms @ 120fps (was 48)
     ThreadSafeQueue<RawAudioFrame> audioInputQueue{16};
 
     // Encoded output queues
-    ThreadSafeQueue<EncodedFrame> videoOutputQueue{96};//视频编码可能产生较大延迟，允许更多待发送帧积压
+    ThreadSafeQueue<EncodedFrame> videoOutputQueue{192}; // 2× headroom for 120fps burst (was 96)
     ThreadSafeQueue<EncodedFrame> audioOutputQueue{32};
 
     // Direct output queue — when set, the encode thread bypasses videoOutputQueue
@@ -100,9 +100,10 @@ bool EncoderManager::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
     // Start encode workers
     m_impl->videoEncodeThread = std::thread([this]() {
         while (m_impl->running) {
-            // 20ms timeout — MFTs have internal buffers; polling at 5ms just
-            // wastes CPU and causes lock contention on the input queue mutex.
-            auto frame = m_impl->videoInputQueue.tryPop(20);
+            // 5ms timeout — at 120 fps the frame interval is 8.33 ms;
+            // a 5 ms poll ensures we dequeue a new frame within each interval
+            // without busy-spinning.  (Was 20 ms, tuned for ≤60 fps.)
+            auto frame = m_impl->videoInputQueue.tryPop(5);
             if (frame) {
                 std::vector<uint8_t> bitstream;
                 bool isKeyFrame = false;

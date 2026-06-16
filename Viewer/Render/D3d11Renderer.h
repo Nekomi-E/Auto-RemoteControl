@@ -35,6 +35,7 @@ public:
 
     void RenderFrame(const uint8_t* rgbaData, uint32_t width, uint32_t height);
     void RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width, uint32_t height);
+    void RenderFrameNv12Ps(ID3D11Texture2D* nv12Texture, uint32_t width, uint32_t height);
     void Present();
 
     ID2D1DeviceContext* GetD2DDeviceContext() const { return m_d2dContext; }

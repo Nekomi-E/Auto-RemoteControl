@@ -62,7 +62,7 @@ void D2dOverlay::Shutdown() {
     m_textFormat = nullptr;
 }
 
-void D2dOverlay::Draw(float fps, bool connected) {
+void D2dOverlay::Draw(float fps, bool connected, bool inputActive) {
     if (!m_initialized || !m_d2dContext) return;
 
     m_d2dContext->BeginDraw();
@@ -75,12 +75,15 @@ void D2dOverlay::Draw(float fps, bool connected) {
         m_d2dContext->FillRectangle(bgRect, m_bgBrush);
     }
 
-    // Connection status
+    // Connection status — use the actual input-capture state (m_inputActive)
+    // instead of GetKeyState(VK_SCROLL), which reads the hardware LED state.
+    // The two can diverge on app startup, fast double-presses, or when the
+    // system's Scroll Lock toggle is changed by another application.
     wchar_t statusText[128];
     swprintf(statusText, 128, L"%s  |  %.1f FPS  |  Scroll Lock: Input %s",
              connected ? L"[CONNECTED]" : L"[DISCONNECTED]",
              fps,
-             (GetKeyState(VK_SCROLL) & 1) ? L"ON" : L"OFF");
+             inputActive ? L"ON" : L"OFF");
 
     auto brush = connected ? m_greenBrush : m_redBrush;
     DrawText(statusText, 8, 4, 14.0f, brush);

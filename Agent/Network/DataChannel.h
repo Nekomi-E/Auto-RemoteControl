@@ -19,4 +19,5 @@ public:
 private:
     SecureChannel* m_secureChannel = nullptr;
     bool m_encrypted = false;
+    std::vector<uint8_t> m_sendBuffer;  // pre-allocated, amortises per-frame heap alloc
 };

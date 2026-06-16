@@ -44,7 +44,7 @@ private:
         int64_t timestampMs = 0;
     };
 
-    ThreadSafeQueue<EncoderManager::EncodedFrame> m_videoSendQueue{64};
+    ThreadSafeQueue<EncoderManager::EncodedFrame> m_videoSendQueue{128}; // ~1s @ 120fps (was 64)
     ThreadSafeQueue<AudioPacket> m_audioSendQueue{64};
     ThreadSafeQueue<Protocol::InputEvent> m_inputQueue{32};
 
