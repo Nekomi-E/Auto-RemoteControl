@@ -7,6 +7,7 @@ set(AGENT_SOURCES
     Encoder/MfVideoEncoder.cpp
     Encoder/MfAudioEncoder.cpp
     Encoder/EncoderManager.cpp
+    Encoder/NvencEncoder.cpp
     Network/AgentNetworkImpl.cpp
     Network/ControlChannel.cpp
     Network/DataChannel.cpp

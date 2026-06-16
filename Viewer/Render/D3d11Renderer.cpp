@@ -582,12 +582,32 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
           hr=m_device->CreateTexture2D(&d,nullptr,&m_vpNv12Tex);
           if(FAILED(hr)){LOG_WARNING("VP: NV12 tex failed");return;} }
 
-        // VP input view (static — never changes after creation)
+        // VP input view
         { D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv={}; iv.FourCC=0;
           iv.ViewDimension=D3D11_VPIV_DIMENSION_TEXTURE2D;
           iv.Texture2D.MipSlice=0; iv.Texture2D.ArraySlice=0;
           hr=m_videoDevice->CreateVideoProcessorInputView(m_vpNv12Tex,m_vpEnumerator,&iv,&m_vpInputView);
           if(FAILED(hr)){LOG_WARNING("VP: input view failed");return;} }
+
+        // VP output → intermediate BGRA texture (avoids swap chain back-buffer
+        // compatibility issues across GPU adapters after display changes)
+        {
+            D3D11_TEXTURE2D_DESC d = {};
+            d.Width=width; d.Height=height; d.MipLevels=1; d.ArraySize=1;
+            d.Format=DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count=1;
+            d.Usage=D3D11_USAGE_DEFAULT;
+            d.BindFlags=D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            hr=m_device->CreateTexture2D(&d,nullptr,&m_vpBgraTex);
+            if(FAILED(hr)){LOG_WARNING("VP: BGRA tex failed");return;}
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov={};
+            ov.ViewDimension=D3D11_VPOV_DIMENSION_TEXTURE2D;
+            hr=m_videoDevice->CreateVideoProcessorOutputView(m_vpBgraTex,m_vpEnumerator,&ov,&m_vpOutputView);
+            if(FAILED(hr)){LOG_WARNING("VP: output view failed");return;}
+            // SRV to sample BGRA in PS for fullscreen draw
+            if(m_vpBgraSRV){m_vpBgraSRV->Release();m_vpBgraSRV=nullptr;}
+            hr=m_device->CreateShaderResourceView(m_vpBgraTex,nullptr,&m_vpBgraSRV);
+            if(FAILED(hr)){LOG_WARNING("VP: BGRA SRV failed");return;}
+        }
 
         // BT.709 color space
         { D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCS={}; inCS.YCbCr_Matrix=1; inCS.Nominal_Range=1;
@@ -595,29 +615,8 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
           m_videoContext->VideoProcessorSetStreamColorSpace(m_videoProcessor,0,&inCS);
           m_videoContext->VideoProcessorSetOutputColorSpace(m_videoProcessor,&outCS); }
 
-        // Release stale VP output view — it will be recreated below
-        // (or left null so it's recreated next frame)
         m_vpWidth=width; m_vpHeight=height;
-        LOG_INFO("RenderFrameNv12: VP NV12 pipeline ready (%ux%u)",width,height);
-    }
-
-    // Recreate VP output view EVERY frame.  The DXGI flip-model swap chain
-    // rotates buffers after each Present(), so a VP output view created on
-    // GetBuffer(0) from a prior frame points to the wrong (now-front) buffer
-    // and writes into oblivion — producing all-black output.  Recreating it
-    // each frame guarantees we always target the current back buffer.
-    {
-        if (m_vpOutputView) { m_vpOutputView->Release(); m_vpOutputView = nullptr; }
-        ID3D11Texture2D* backBuffer = nullptr;
-        HRESULT hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
-        if (SUCCEEDED(hr)) {
-            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov = {};
-            ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-            hr = m_videoDevice->CreateVideoProcessorOutputView(
-                backBuffer, m_vpEnumerator, &ov, &m_vpOutputView);
-            backBuffer->Release();
-        }
-        if (!m_vpOutputView) return; // silently skip — will retry next frame
+        LOG_INFO("RenderFrameNv12: VP NV12→BGRA pipeline ready (%ux%u)",width,height);
     }
 
     // Copy decoder NV12 → staging
@@ -629,7 +628,7 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
             b.right=(width+1)/2;b.bottom=(height+1)/2;
             m_context->CopySubresourceRegion(m_vpNv12Tex,1,0,0,0,nv12Texture,1,&b); } }
 
-    // VP: NV12 → back buffer (single GPU blit, no extra Draw)
+    // VP: NV12 → BGRA intermediate texture
     RECT rc={0,0,(LONG)width,(LONG)height};
     m_videoContext->VideoProcessorSetStreamSourceRect(m_videoProcessor,0,TRUE,&rc);
     m_videoContext->VideoProcessorSetStreamDestRect(m_videoProcessor,0,TRUE,&rc);
@@ -637,7 +636,22 @@ void D3d11Renderer::RenderFrameNv12(ID3D11Texture2D* nv12Texture, uint32_t width
     s.InputFrameOrField=0; s.PastFrames=0; s.FutureFrames=0;
     s.ppPastSurfaces=nullptr; s.pInputSurface=m_vpInputView; s.ppFutureSurfaces=nullptr;
     HRESULT hr=m_videoContext->VideoProcessorBlt(m_videoProcessor,m_vpOutputView,0,1,&s);
-    if(FAILED(hr)){ static int n=0; if(++n<=5)LOG_WARNING("VP: Blt failed: 0x%08X",hr); }
+    if(FAILED(hr)){ static int n=0; if(++n<=5)LOG_WARNING("VP: Blt failed: 0x%08X",hr); return; }
+
+    // Draw BGRA intermediate → swap chain back buffer via fullscreen triangle
+    if (m_vpBgraSRV && m_quadVB && m_vertexShader && m_pixelShader) {
+        UINT stride = sizeof(QuadVertex);
+        UINT offset = 0;
+        m_context->IASetVertexBuffers(0, 1, &m_quadVB, &stride, &offset);
+        m_context->IASetInputLayout(m_inputLayout);
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_context->VSSetShader(m_vertexShader, nullptr, 0);
+        m_context->PSSetShader(m_pixelShader, nullptr, 0);
+        m_context->PSSetShaderResources(0, 1, &m_vpBgraSRV);
+        m_context->PSSetSamplers(0, 1, &m_sampler);
+        m_context->OMSetRenderTargets(1, &m_rtv, nullptr);
+        m_context->Draw(3, 0);
+    }
 }
 
 // NV12 → back-buffer via pixel shader, bypassing the D3D11 Video Processor.

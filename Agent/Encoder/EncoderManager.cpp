@@ -1,6 +1,7 @@
 #include "EncoderManager.h"
 #include "MfVideoEncoder.h"
 #include "MfAudioEncoder.h"
+#include "NvencEncoder.h"
 #include "Common/Utils/Logger.h"
 #include <d3d11.h>
 #include "Common/Utils/Timer.h"
@@ -10,9 +11,11 @@
 #include <mutex>
 
 struct EncoderManager::Impl {
-    std::unique_ptr<MfVideoEncoder> videoEncoder;
+    std::unique_ptr<NvencEncoder> nvencEncoder;   // NVENC direct (priority)
+    std::unique_ptr<MfVideoEncoder> videoEncoder;  // MFT fallback
     std::unique_ptr<MfAudioEncoder> audioEncoder;
     bool audioEnabled = false;
+    bool useNvenc = false;
 
     // Raw frame input queues
     struct RawVideoFrame {
@@ -73,14 +76,28 @@ bool EncoderManager::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
     m_impl->targetFps = fps;
     m_impl->audioEnabled = enableAudio;
 
-    // Initialize video encoder
-    m_impl->videoEncoder = std::make_unique<MfVideoEncoder>();
-    if (!m_impl->videoEncoder->Initialize(width, height, bitrate, fps, quality,
-                                           d3dDevice, d3dContext)) {
-        LOG_ERROR("Failed to initialize video encoder");
-        return false;
+    // --- Try NVIDIA NVENC first (direct GPU API, bypasses MFT limitations) ---
+    // NVENC handles 2560×1600 @ 120 fps with <2 ms encode latency via the
+    // dedicated ASIC block on the GPU.  Falls back to MFT if NVENC DLL is
+    // not available (no NVIDIA GPU, driver too old, etc.).
+    m_impl->nvencEncoder = std::make_unique<NvencEncoder>();
+    if (m_impl->nvencEncoder->Initialize(width, height, bitrate, fps, 0, // 0=H.264
+                                          d3dDevice, d3dContext)) {
+        m_impl->useNvenc = true;
+        LOG_INFO("Video encoder initialized: NVIDIA NVENC H.264 (direct GPU)");
+    } else {
+        m_impl->nvencEncoder.reset();
+        LOG_INFO("NVENC not available, falling back to MFT encoder...");
+
+        // Fall back to MFT encoders
+        m_impl->videoEncoder = std::make_unique<MfVideoEncoder>();
+        if (!m_impl->videoEncoder->Initialize(width, height, bitrate, fps, quality,
+                                               d3dDevice, d3dContext)) {
+            LOG_ERROR("Failed to initialize video encoder");
+            return false;
+        }
+        LOG_INFO("Video encoder initialized (MFT fallback)");
     }
-    LOG_INFO("Video encoder initialized");
 
     // Initialize audio encoder if enabled
     if (enableAudio) {
@@ -109,8 +126,15 @@ bool EncoderManager::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
                 bool isKeyFrame = false;
                 bool ok = false;
 
-                if (frame->gpuTexture) {
-                    // GPU fast path: capture texture → video processor → encoder
+                if (m_impl->useNvenc && frame->gpuTexture) {
+                    // NVENC direct GPU path: BGRA texture → NVENC ASIC block
+                    // (zero CPU copy, <2 ms encode on RTX 4080)
+                    ok = m_impl->nvencEncoder->EncodeFrameGpu(
+                        frame->gpuTexture, frame->width, frame->height,
+                        bitstream, isKeyFrame);
+                    frame->gpuTexture->Release();
+                } else if (frame->gpuTexture) {
+                    // MFT GPU path: capture texture → video processor → encoder
                     ok = m_impl->videoEncoder->EncodeFrameGpu(
                         frame->gpuTexture, frame->width, frame->height,
                         bitstream, isKeyFrame);
@@ -191,6 +215,7 @@ void EncoderManager::Stop() {
     if (m_impl->videoEncodeThread.joinable()) m_impl->videoEncodeThread.join();
     if (m_impl->audioEncodeThread.joinable()) m_impl->audioEncodeThread.join();
 
+    if (m_impl->nvencEncoder) m_impl->nvencEncoder->Shutdown();
     if (m_impl->videoEncoder) m_impl->videoEncoder->Shutdown();
     if (m_impl->audioEncoder) m_impl->audioEncoder->Shutdown();
 }
@@ -253,25 +278,32 @@ bool EncoderManager::GetEncodedAudioFrame(EncodedFrame& outFrame, int timeoutMs)
 
 void EncoderManager::AdjustBitrate(uint32_t bitrate) {
     m_impl->targetBitrate = bitrate;
-    if (m_impl->videoEncoder) {
+    if (m_impl->useNvenc && m_impl->nvencEncoder) {
+        m_impl->nvencEncoder->SetBitrate(bitrate);
+    } else if (m_impl->videoEncoder) {
         m_impl->videoEncoder->SetBitrate(bitrate);
     }
 }
 
 uint32_t EncoderManager::GetEncoderWidth() const {
+    if (m_impl->useNvenc && m_impl->nvencEncoder) return m_impl->nvencEncoder->GetWidth();
     return m_impl->videoEncoder ? m_impl->videoEncoder->GetWidth() : 1920;
 }
 
 uint32_t EncoderManager::GetEncoderHeight() const {
+    if (m_impl->useNvenc && m_impl->nvencEncoder) return m_impl->nvencEncoder->GetHeight();
     return m_impl->videoEncoder ? m_impl->videoEncoder->GetHeight() : 1080;
 }
 
 uint32_t EncoderManager::GetCodecType() const {
+    if (m_impl->useNvenc && m_impl->nvencEncoder) return m_impl->nvencEncoder->GetCodecType();
     return m_impl->videoEncoder ? m_impl->videoEncoder->GetCodecType() : 0;
 }
 
 void EncoderManager::RequestKeyFrame() {
-    if (m_impl->videoEncoder) {
+    if (m_impl->useNvenc && m_impl->nvencEncoder) {
+        m_impl->nvencEncoder->RequestKeyFrame();
+    } else if (m_impl->videoEncoder) {
         m_impl->videoEncoder->RequestKeyFrame();
     }
 }

@@ -254,36 +254,57 @@ bool DxgiScreenCapture::AcquireFrame(CapturedFrame& outFrame) {
 bool DxgiScreenCapture::AcquireFrameGpu(CapturedFrameGpu& outFrame) {
     if (m_monitors.empty()) return false;
 
-    // Minimal pacing — sleep 1 ms to yield the CPU, then let AcquireNextFrame
-    // provide natural VSync pacing.  The old fixed-interval sleep was designed
-    // for ≤60 fps and creates subharmonic capture (e.g. 8 ms sleep + 8 ms wait
-    // = 16 ms gap → 63 fps on a 120 Hz display).  At ≥120 fps the frame budget
-    // is 8.33 ms, so any artificial sleep steals from the encoder budget.
-    // DXGI Desktop Duplication already enforces VSync; we don't need a second
-    // software pacing layer on top of it.
+    // Pace to target FPS — without this the capture floods the encoder queue
+    // at 180-210 fps, causing massive frame drops when the encoder can only
+    // handle ~60-80 fps (software HEVC).  DXGI delivers frames at the VSync
+    // rate (120 Hz = 8.33 ms), so pacing at the same rate prevents bursts
+    // without creating the subharmonic that the old 8 ms integer sleep caused.
+    // At targetFps=120: interval = 8 ms, matching 120 Hz VSync naturally.
     auto now = Timer::NowMs();
+    double intervalD = 1000.0 / static_cast<double>(m_targetFps);
+    int64_t frameInterval = static_cast<int64_t>(intervalD);
     int64_t elapsed = now - m_lastFrameTime;
-    if (elapsed < 1) {
-        PrecisionSleepMs(1);
+    if (elapsed < frameInterval) {
+        PrecisionSleepMs(frameInterval - elapsed);
     }
 
-    // One-time diagnostic: warn if target FPS exceeds the monitor's actual
-    // refresh rate. DXGI Desktop Duplication is VSync-bound and cannot deliver
-    // frames faster than the display hardware.
+    // Runtime DWM cadence diagnostic: track actual inter-frame gaps over
+    // the first second of capture and report the measured VSync rate.
+    // FindClosestMatchingMode reports the monitor's CAPABILITY; the actual
+    // DWM composition rate can differ (e.g. multi-monitor sync, power saving).
     {
-        static bool vsyncWarned = false;
-        if (!vsyncWarned && !m_monitors.empty()) {
-            vsyncWarned = true;
-            float monRefresh = m_monitors[0].refreshRate;
-            if (static_cast<float>(m_targetFps) > monRefresh + 1.0f) {
-                LOG_WARNING("[CaptureGpu] Target FPS (%u) exceeds monitor refresh rate (%.1f Hz). "
-                           "DXGI Desktop Duplication is VSync-bound — effective capture rate will be "
-                           "capped at the display's refresh rate (~%.1f fps). "
-                           "To achieve %u fps, use a monitor with >=%u Hz refresh rate.",
-                           m_targetFps, monRefresh, monRefresh, m_targetFps, m_targetFps);
-            } else {
-                LOG_INFO("[CaptureGpu] Target FPS: %u, Monitor refresh: %.1f Hz — VSync headroom OK",
-                         m_targetFps, monRefresh);
+        static int64_t diagStartMs = 0;
+        static int32_t diagFrames = 0;
+        static int64_t diagSumUs = 0;
+        static bool diagDone = false;
+
+        if (!diagDone) {
+            if (diagStartMs == 0 && m_lastFrameTime > 0) {
+                diagStartMs = m_lastFrameTime;
+                diagFrames = 0;
+                diagSumUs = 0;
+            } else if (diagStartMs > 0 && m_lastFrameTime > diagStartMs) {
+                diagFrames++;
+                int64_t elapsedUs = (m_lastFrameTime - diagStartMs) * 1000;
+                if (diagFrames > 0) {
+                    diagSumUs += (m_lastFrameTime - diagStartMs) * 1000;
+                }
+                // After collecting 1 second worth of data
+                if (m_lastFrameTime - diagStartMs >= 1000) {
+                    float measuredHz = diagFrames * 1000.0f / (m_lastFrameTime - diagStartMs);
+                    float measuredMs = (m_lastFrameTime - diagStartMs) * 1.0f / (diagFrames > 0 ? diagFrames : 1);
+                    LOG_INFO("[CaptureGpu] DWM measured cadence: %.1f Hz (%.1f ms/frame) over %d frames — "
+                             "monitor capability: %.1f Hz, target: %u fps",
+                             measuredHz, measuredMs, diagFrames,
+                             m_monitors[0].refreshRate, m_targetFps);
+                    if (measuredHz < m_targetFps * 0.9f) {
+                        LOG_WARNING("[CaptureGpu] Actual DWM rate (%.1f Hz) is far below target (%u fps). "
+                                   "Check: Windows Settings → Display → Advanced → refresh rate is active at "
+                                   "the expected value. Multi-monitor setups often lock DWM to 60 Hz "
+                                   "regardless of per-monitor settings.", measuredHz, m_targetFps);
+                    }
+                    diagDone = true;
+                }
             }
         }
     }

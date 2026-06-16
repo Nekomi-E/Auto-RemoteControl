@@ -306,7 +306,10 @@ bool MfVideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t bitrat
         }
     }
 
-    if (width > 1920 || height > 1080) {
+    if ((width > 1920 || height > 1080) && !configured) {
+        // Reset bitrate — H.264 HW probe may have inflated it (2.5 bpp lossless)
+        // which would choke software HEVC at 120 fps.
+        m_impl->bitrate = bitrate;
         LOG_INFO("Target resolution %ux%u > 1080p, searching HEVC encoders (may take several seconds)...",
                  width, height);
 
